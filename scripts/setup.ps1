@@ -25,10 +25,11 @@ function Resolve-Backend([string]$Requested) {
 }
 
 $Selected = Resolve-Backend $Backend
-$PythonVersion = & $Python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+$PythonDetails = & $Python -c "import platform, struct, sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{platform.python_implementation()}|{struct.calcsize('P') * 8}')"
 if ($LASTEXITCODE -ne 0) { throw "Python could not be started with '$Python'." }
-if ($Selected -eq "rocm" -and $PythonVersion.Trim() -ne "3.12") {
-    throw "AMD ROCm on Windows currently requires Python 3.12. Found $PythonVersion."
+$PythonVersion, $PythonImplementation, $PythonBits = $PythonDetails.Trim().Split("|")
+if ($PythonVersion -ne "3.12" -or $PythonImplementation -ne "CPython" -or $PythonBits -ne "64") {
+    throw "Reference Desk requires 64-bit CPython 3.12. Found $PythonVersion $PythonImplementation $PythonBits-bit."
 }
 
 Write-Host "Preparing Reference Desk for $Selected" -ForegroundColor Cyan
