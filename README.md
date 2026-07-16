@@ -30,78 +30,65 @@ The recommended computer has:
 CPU mode is available, but document processing and reranking will be much
 slower. Node.js is not required unless you plan to change the interface.
 
-## First-time installation on Windows
+## Easy Windows installation
 
-### 1. Install the prerequisites
+You do not need Git, GitHub CLI, or programming experience for this method.
 
-Install these applications before continuing:
+### 1. Install Python and Ollama
+
+Install these two applications before continuing:
 
 1. [Python for Windows](https://www.python.org/downloads/windows/) — choose a
    64-bit Python 3.12 release and enable **Add Python to PATH** during setup.
-2. [Git for Windows](https://git-scm.com/download/win).
-3. [GitHub CLI](https://cli.github.com/).
-4. [Ollama for Windows](https://ollama.com/download/windows).
-5. The latest driver for your NVIDIA or AMD GPU.
+2. [Ollama for Windows](https://ollama.com/download/windows).
 
-Git and GitHub CLI can also be installed from PowerShell with Windows Package
-Manager:
+Also install the latest driver for your NVIDIA or AMD GPU.
 
-```powershell
-winget install --id Git.Git -e
-winget install --id GitHub.cli -e
-```
+### 2. Download and extract Reference Desk
 
-Close and reopen PowerShell after installing them.
+[Download the latest Windows ZIP](https://github.com/FKENZOLS/reference-desk/releases/latest/download/reference-desk-windows.zip)
 
-### 2. Download Reference Desk with GitHub CLI
+Open the downloaded ZIP and select **Extract all**. Do not run the application
+from inside the ZIP.
 
-Open PowerShell and run:
+### 3. Double-click `SETUP.bat`
+
+The setup detects NVIDIA CUDA, AMD ROCm, or CPU mode, creates an isolated
+Python environment, installs the correct packages, downloads EmbeddingGemma,
+and checks the computer. The first installation is several gigabytes and can
+take a while.
+
+The window stays open if anything goes wrong, so the error message can be
+read. Common solutions are also included in `INSTALL_WINDOWS.txt`.
+
+### 4. Double-click `START.bat`
+
+Reference Desk normally opens automatically. If it does not, visit
+[http://127.0.0.1:7860](http://127.0.0.1:7860).
+
+Keep the command window open while using the app. Close it, or press `Ctrl+C`,
+to stop Reference Desk. Double-click `START.bat` whenever you want to use it
+again.
+
+<details>
+<summary>Install with GitHub CLI instead</summary>
+
+Install [Git for Windows](https://git-scm.com/download/win) and
+[GitHub CLI](https://cli.github.com/), then open PowerShell:
 
 ```powershell
 gh auth login --web --git-protocol https
 cd "$HOME\Documents"
 gh repo clone FKENZOLS/reference-desk
 cd reference-desk
-```
-
-The first command opens GitHub in your browser. Complete the sign-in and return
-to PowerShell when it finishes.
-
-### 3. Run the automatic setup
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend auto
-```
-
-The setup creates an isolated Python environment, detects NVIDIA CUDA or AMD
-ROCm, installs the correct packages, downloads EmbeddingGemma through Ollama,
-and checks the GPU. The first installation is several gigabytes and can take a
-while.
-
-If automatic detection selects the wrong backend, replace `auto` with one of:
-
-```powershell
-# AMD GPU
-powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend rocm
-
-# NVIDIA GPU
-powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend cuda
-
-# Slow compatibility mode
-powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend cpu
-```
-
-### 4. Start the application
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
-Reference Desk normally opens automatically. If it does not, visit
-[http://127.0.0.1:7860](http://127.0.0.1:7860).
+If automatic detection selects the wrong backend, replace `auto` with `rocm`,
+`cuda`, or `cpu`.
 
-Keep the PowerShell window open while using the app. Press `Ctrl+C` in that
-window to stop it.
+</details>
 
 ## Add and search documents
 
@@ -117,7 +104,13 @@ the rest of the queue.
 
 ## Update to the latest version
 
-Open PowerShell in the `reference-desk` folder and run:
+If you installed the ZIP, download it again, extract it over the existing
+`reference-desk` folder, and allow Windows to replace files with matching
+names. The package contains no PDFs or research databases, so your local data
+is left in place. Run `SETUP.bat` again after a major update.
+
+If you installed with Git, open PowerShell in the `reference-desk` folder and
+run:
 
 ```powershell
 git pull --ff-only
