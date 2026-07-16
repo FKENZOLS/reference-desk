@@ -1,0 +1,4 @@
+# Install a hardware-specific PyTorch build first with scripts/setup.ps1 or
+# scripts/setup.sh. Keeping it out of this file prevents CUDA wheels from being
+# installed on AMD machines (and vice versa).
+-r requirements-base.txt

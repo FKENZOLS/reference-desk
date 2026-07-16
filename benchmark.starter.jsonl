@@ -1,0 +1,9 @@
+{"query":"What is the maximum operational speed of the monorail system?","answerable":true,"relevant_locations":[{"source_id":"IMA_Monorail-Performance-Specification_Edition-1.1-June-2026.pdf","page":37}]}
+{"query":"How is Station Dwell Reaction Time defined?","answerable":true,"relevant_locations":[{"source_id":"IMA_Monorail-Performance-Specification_Edition-1.1-June-2026.pdf","page":51}]}
+{"query":"How is System Design Headway defined?","answerable":true,"relevant_locations":[{"source_id":"IMA_Monorail-Performance-Specification_Edition-1.1-June-2026.pdf","page":50}]}
+{"query":"What requirements apply to emergency braking rates?","answerable":true,"relevant_locations":[{"source_id":"IMA_Monorail-Performance-Specification_Edition-1.1-June-2026.pdf","page":89}]}
+{"query":"What does the acronym SDRT stand for?","answerable":true,"relevant_locations":[{"source_id":"IMA_Monorail-Performance-Specification_Edition-1.1-June-2026.pdf","page":22}]}
+{"query":"Qual é a definição formal de limite de uma função?","answerable":true,"relevant_locations":[{"source_id":"bases.pdf","page":244}]}
+{"query":"Onde é apresentado o Teorema do Valor Intermediário?","answerable":true,"relevant_locations":[{"source_id":"bases.pdf","page":266}]}
+{"query":"Qual é a definição precisa do limite de uma sequência?","answerable":true,"relevant_locations":[{"source_id":"bases.pdf","page":192}]}
+{"query":"What is the reactor coolant pressure specified by these documents?","answerable":false,"relevant_locations":[]}

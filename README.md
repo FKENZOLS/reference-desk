@@ -226,4 +226,3 @@ python main.py ingest --force
 
 The source tree intentionally excludes local documents and generated data, so
 it can be shared without packaging the private corpus or Chroma database.
-

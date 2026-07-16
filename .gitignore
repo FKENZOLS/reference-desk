@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.uv-cache/
+build/
+dist/
+!frontend/dist/
+!frontend/dist/**
+wheels/
+*.egg-info
+release/
+.rag-profile
+.env
+
+# Virtual environments
+.venv/
+frontend/node_modules/
+frontend/.npm-cache/
+frontend/.vite/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local logs and temporary uploads
+*.log
+*.part
+
+# Private source documents and generated indexes
+docs/*
+!docs/.gitkeep
+chroma_db/
+ingestion_debug/
+document_trash/
+document_quarantine/
+document_revisions/
+corpus_backups/
+evaluation_results*.json
+
+# Local research-workspace data
+reference_workspace.sqlite3
+reference_workspace.sqlite3-shm
+reference_workspace.sqlite3-wal

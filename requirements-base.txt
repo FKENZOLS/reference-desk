@@ -1,0 +1,11 @@
+chromadb>=1.0,<2
+docling>=2.40,<3
+docling-core>=2.40,<3
+fastapi>=0.115,<1
+gradio>=5,<7
+langchain-chroma>=0.2,<2
+langchain-core>=0.3,<2
+langchain-ollama>=0.3,<2
+pypdfium2>=4,<6
+transformers>=4.56,<6
+uvicorn[standard]>=0.30,<1
