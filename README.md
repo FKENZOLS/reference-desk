@@ -24,7 +24,7 @@ The recommended computer has:
 - Windows 10 or Windows 11.
 - Python 3.12, 64-bit.
 - Ollama.
-- An NVIDIA CUDA or AMD ROCm-compatible GPU with at least 8 GB VRAM.
+- An NVIDIA CUDA or AMD ROCm-compatible GPU.
 - A current GPU driver.
 
 CPU mode is available, but document processing and reranking will be much
