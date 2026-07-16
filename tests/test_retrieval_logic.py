@@ -117,9 +117,17 @@ def test_cpu_device_is_always_available() -> None:
 
 
 def test_requested_cuda_never_silently_falls_back(monkeypatch) -> None:
+    monkeypatch.setattr(search_app, "COMPUTE_BACKEND", "cpu")
     monkeypatch.setattr(search_app.torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CUDA was requested"):
         resolve_torch_device("cuda")
+
+
+def test_requested_rocm_reports_the_requested_backend(monkeypatch) -> None:
+    monkeypatch.setattr(search_app, "COMPUTE_BACKEND", "cpu")
+    monkeypatch.setattr(search_app.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="AMD ROCm was requested"):
+        resolve_torch_device("rocm")
 
 
 def test_source_url_opens_the_first_page() -> None:

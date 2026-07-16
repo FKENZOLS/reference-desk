@@ -241,7 +241,8 @@ class BGEReranker:
 def resolve_torch_device(configured: str) -> torch.device:
     """Resolve a PyTorch device for either NVIDIA CUDA or AMD ROCm."""
 
-    value = configured.strip().lower()
+    requested = configured.strip().lower()
+    value = requested
     if value == "auto":
         value = "cuda:0" if COMPUTE_BACKEND in {"cuda", "rocm"} else "cpu"
     elif value in {"cuda", "nvidia", "rocm", "amd", "hip"}:
@@ -250,8 +251,17 @@ def resolve_torch_device(configured: str) -> torch.device:
     if value.startswith("cuda"):
         if not torch.cuda.is_available():
             build = torch.version.hip or torch.version.cuda or "CPU-only"
+            if requested in {"rocm", "amd", "hip"}:
+                requested_backend = "rocm"
+            elif requested in {"cuda", "nvidia"}:
+                requested_backend = "cuda"
+            elif COMPUTE_BACKEND in {"cuda", "rocm"}:
+                # ROCm intentionally uses PyTorch's cuda:N device notation.
+                requested_backend = COMPUTE_BACKEND
+            else:
+                requested_backend = "cuda"
             raise RuntimeError(
-                f"{backend_label(COMPUTE_BACKEND)} was requested for the reranker, "
+                f"{backend_label(requested_backend)} was requested for the reranker, "
                 f"but this PyTorch build cannot use a GPU (runtime: {build}). "
                 "Run the portable setup script for this machine or select CPU."
             )
