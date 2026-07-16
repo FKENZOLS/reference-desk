@@ -1,0 +1,65 @@
+REFERENCE DESK - WINDOWS INSTALLATION
+=====================================
+
+Before you begin
+----------------
+Install these two applications:
+
+1. Python 3.12, 64-bit
+   https://www.python.org/downloads/windows/
+   Enable "Add Python to PATH" during installation.
+
+2. Ollama for Windows
+   https://ollama.com/download/windows
+
+You also need a current NVIDIA or AMD graphics driver. A GPU with at least
+8 GB of video memory is recommended. CPU mode works but is much slower.
+
+Install Reference Desk
+----------------------
+1. Extract the entire ZIP file. Do not run the app from inside the ZIP.
+2. Double-click SETUP.bat.
+3. Wait for the success message. The first setup downloads several gigabytes.
+4. Double-click START.bat.
+5. The app should open at http://127.0.0.1:7860
+
+The setup detects NVIDIA CUDA, AMD ROCm, or CPU mode automatically. If Windows
+asks whether to allow a script from this downloaded ZIP, continue only if you
+downloaded it from https://github.com/FKENZOLS/reference-desk/releases
+
+Using the app
+-------------
+1. Open Documents in the left menu.
+2. Add PDF files and select Apply pending changes.
+3. Wait for indexing to finish.
+4. Open Search and search the whole collection.
+
+Your PDFs, indexes, notes, and bookmarks remain on this computer.
+
+Stopping and starting later
+---------------------------
+Close the Reference Desk command window, or press Ctrl+C in it, to stop.
+Double-click START.bat to use the app again. SETUP.bat is only needed for the
+first installation or after a major update.
+
+Common problems
+---------------
+"Python was not found"
+  Reinstall 64-bit Python 3.12 with "Add Python to PATH" enabled, then restart
+  the computer and run SETUP.bat again.
+
+"Ollama is unavailable"
+  Start Ollama, open Command Prompt, and run: ollama pull embeddinggemma
+
+"Out of memory"
+  Close games, AI tools, and other GPU-heavy applications, then try again.
+
+AMD setup fails
+  Update the AMD graphics driver. Ollama support alone does not guarantee that
+  the same GPU supports PyTorch ROCm. The setup can use slower CPU mode if the
+  GPU is unsupported; see README.md for the manual command.
+
+More help
+---------
+Read README.md or visit:
+https://github.com/FKENZOLS/reference-desk
