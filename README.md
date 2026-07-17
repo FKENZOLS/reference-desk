@@ -1,8 +1,16 @@
 # Reference Desk
 
+[![Tests](https://github.com/FKENZOLS/reference-desk/actions/workflows/tests.yml/badge.svg)](https://github.com/FKENZOLS/reference-desk/actions/workflows/tests.yml)
+[![Latest release](https://img.shields.io/github/v/release/FKENZOLS/reference-desk)](https://github.com/FKENZOLS/reference-desk/releases/latest)
+![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+
 Reference Desk is a private, local search application for PDF collections. It
 finds relevant passages across all your documents and opens the exact page and
 highlighted source region.
+
+It is an evidence-first alternative to answer-generation tools: the retrieval
+pipeline returns ranked source passages and always preserves a direct route to
+the original PDF evidence.
 
 Your PDFs, indexes, bookmarks, and notes stay on your computer. They are not
 uploaded to GitHub.
@@ -127,8 +135,6 @@ GitHub contains only the application. Your PDFs and research data are separate.
 1. In the old installation, open **Documents** and select **Create backup**.
 2. Install Reference Desk on the new computer using the instructions above.
 3. Open **Documents** on the new computer and restore the backup.
-
-See [GITHUB_TRANSFER.md](GITHUB_TRANSFER.md) for the shorter transfer checklist.
 
 ## Troubleshooting
 
@@ -307,7 +313,7 @@ counts, fusion, or reranking to be compared against real reference tasks.
 ```powershell
 python main.py serve
 python main.py ingest
-python main.py evaluate benchmark.starter.jsonl
+python main.py evaluate examples/benchmark.example.jsonl
 python main.py doctor
 python main.py export
 python main.py test
