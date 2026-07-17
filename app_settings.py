@@ -196,7 +196,7 @@ def resolve_reranker_choice(configured: str) -> str:
 RERANKER_CHOICE = resolve_reranker_choice(
     os.environ.get(
         "RAG_RERANKER_CHOICE",
-        "qwen",
+        "bge",
     )
 )
 
