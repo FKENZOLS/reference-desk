@@ -323,13 +323,13 @@ makes rollback possible but may temporarily use additional disk space.
 
 ### What the quality metrics mean
 
-- **Recall@k** asks whether a known relevant passage appears anywhere in the
+- **Recall** asks whether a known relevant passage appears anywhere in the
   first `k` results. It reveals whether retrieval found the evidence at all.
 - **MRR (Mean Reciprocal Rank)** looks only at the first relevant result. A
   first-place hit scores `1`, second place scores `1/2`, fifth place scores
   `1/5`, and the scores are averaged across queries. Higher MRR means useful
   evidence appears sooner.
-- **nDCG@k** rewards placing all relevant results near the top and can give
+- **nDCG** rewards placing all relevant results near the top and can give
   more credit to more-relevant passages. Its logarithmic discount makes a
   relevant result at rank 2 worth more than the same result at rank 10.
 - **Rejection accuracy** checks whether the system correctly reports that no
