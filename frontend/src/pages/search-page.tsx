@@ -4,6 +4,7 @@ import { toast } from "sonner"
 import { EmptyState } from "@/components/empty-state"
 import { PageHeader } from "@/components/page-header"
 import { SearchResultCard } from "@/components/search-result-card"
+import { SearchScopeSelect } from "@/components/search-scope-select"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -81,11 +82,7 @@ export function SearchPage() {
             <div className="grid gap-3 md:grid-cols-[minmax(220px,30%)_1fr_auto] md:items-end">
               <div>
                 <Label htmlFor="search-source">Search scope</Label>
-                <div className="select-wrap">
-                  <select id="search-source" className="native-select" value={source} onChange={(event) => setSource(event.target.value)}>
-                    {sources.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-                  </select>
-                </div>
+                <SearchScopeSelect id="search-source" value={source} options={sources} onChange={setSource} />
               </div>
               <div>
                 <Label htmlFor="search-query">Query</Label>
