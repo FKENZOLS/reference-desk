@@ -3,6 +3,7 @@
 [![Tests](https://github.com/FKENZOLS/reference-desk/actions/workflows/tests.yml/badge.svg)](https://github.com/FKENZOLS/reference-desk/actions/workflows/tests.yml)
 [![Latest release](https://img.shields.io/github/v/release/FKENZOLS/reference-desk)](https://github.com/FKENZOLS/reference-desk/releases/latest)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Reference Desk is a private, local search application for PDF collections. It
 finds relevant passages across all your documents and opens the exact page and
@@ -328,6 +329,4 @@ citations, or storage.
 
 ## License
 
-No open-source license has been selected yet. The repository is public for
-viewing and personal installation; public availability alone does not grant
-additional reuse rights.
+Reference Desk is released under the [MIT License](LICENSE).
