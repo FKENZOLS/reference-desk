@@ -2224,7 +2224,7 @@ def source_viewer_html(
 <body data-highlight-mode="subtle">
   <div class="shell">
     <aside class="source-panel">
-      <a class="back" href="/">← Back to results</a>
+      <a class="back" href="/" onclick="if (window.history.length > 1) { window.history.back(); return false; }">← Back to results</a>
       @@SOURCE_NAVIGATION@@
       <p class="eyebrow">Retrieved source</p>
       <h1>@@TITLE@@</h1>
