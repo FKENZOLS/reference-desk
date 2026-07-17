@@ -55,7 +55,7 @@ Also install the latest driver for your NVIDIA or AMD GPU.
 
 ### 2. Download and extract Reference Desk
 
-[Download the latest Windows ZIP](https://github.com/FKENZOLS/reference-desk/releases/latest/download/reference-desk-windows.zip)
+[Download the latest Windows ZIP](https://github.com/FKENZOLS/reference-desk/archive/refs/heads/main.zip)
 
 Open the downloaded ZIP and select **Extract all**. Do not run the application
 from inside the ZIP.
