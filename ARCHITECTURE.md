@@ -69,8 +69,9 @@ workspace matters.
 4. A source becomes current only after its complete document update succeeds.
 5. Manual pruning stays explicit. The document manager may request pruning
    because it owns the staged file changes.
-6. Search and ingestion must not keep both model stacks resident on the target
-   GPU. The supported baseline is 8 GB VRAM.
+6. Search and ingestion may share a GPU only when live free VRAM covers the
+   Docling headroom plus a query reserve. Otherwise ingestion releases search
+   models and runs exclusively; total VRAM alone is not the deciding factor.
 7. Citation metadata must retain page and bounding-box provenance when Docling
    provides it.
 8. Workspace data is independent from ingestion and must survive index rebuilds.
@@ -106,11 +107,15 @@ workspace matters.
 
 1. Stage document changes in `DocumentRepository` and create persistent queue items.
 2. Block new searches and wait for the current search lock.
-3. Release the reranker and retained Ollama embedding model.
+3. Measure free VRAM. Keep the loaded search runtime only when the combined
+   Docling and query reserve fits; otherwise release the reranker and retained
+   Ollama embedding model.
 4. Run the selected sources through `ingest.py --queue-managed --prune`.
 5. Commit each successful source immediately; quarantine a failed source and continue.
 6. Honor pause requests before beginning the next document.
 7. Prune deleted and quarantined sources, then reload search resources lazily.
+   Concurrent searches may see the previous or newly committed source state
+   while a document is being processed.
 
 ## Where to make common changes
 

@@ -220,6 +220,40 @@ def test_search_is_paused_during_document_maintenance() -> None:
         search_app._DOCUMENT_MAINTENANCE.clear()
 
 
+def test_concurrent_ingestion_uses_live_free_memory_not_total(monkeypatch) -> None:
+    monkeypatch.setattr(search_app, "_RUNTIME", object())
+    monkeypatch.setattr(search_app, "SEARCH_DURING_INGESTION", "auto")
+    monkeypatch.setattr(search_app, "DOCLING_GPU_HEADROOM_MB", 3500)
+    monkeypatch.setattr(search_app, "CONCURRENT_QUERY_RESERVE_MB", 768)
+    monkeypatch.setattr(search_app, "_gpu_memory_mib", lambda: (4268, 6144))
+
+    allowed, _ = search_app.concurrent_ingestion_policy()
+
+    assert allowed is True
+    monkeypatch.setattr(search_app, "_gpu_memory_mib", lambda: (4267, 24576))
+    allowed, reason = search_app.concurrent_ingestion_policy()
+    assert allowed is False
+    assert "4267 MiB free" in reason
+
+
+def test_concurrent_indexing_allows_a_query_when_headroom_remains(monkeypatch) -> None:
+    monkeypatch.setattr(search_app, "_RUNTIME", object())
+    monkeypatch.setattr(search_app, "SEARCH_DURING_INGESTION", "auto")
+    monkeypatch.setattr(search_app, "CONCURRENT_QUERY_RESERVE_MB", 768)
+    monkeypatch.setattr(search_app, "_gpu_memory_mib", lambda: (900, 6144))
+    monkeypatch.setattr(
+        search_app,
+        "_DOCUMENT_JOB",
+        {"running": True, "search_available": True, "log": []},
+    )
+
+    search_app._guard_search_during_ingestion()
+
+    monkeypatch.setattr(search_app, "_gpu_memory_mib", lambda: (767, 6144))
+    with pytest.raises(search_app.DocumentMaintenanceError, match="767 MiB"):
+        search_app._guard_search_during_ingestion()
+
+
 def test_successful_background_job_clears_pending_changes(monkeypatch) -> None:
     cleared = []
     fake_repository = SimpleNamespace(clear_pending=lambda: cleared.append(True))

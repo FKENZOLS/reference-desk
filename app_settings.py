@@ -113,6 +113,26 @@ QUALITY_MIN_POSITIVE_LABELS = env_int("RAG_QUALITY_MIN_POSITIVE_LABELS", 20)
 QUALITY_MIN_NEGATIVE_LABELS = env_int("RAG_QUALITY_MIN_NEGATIVE_LABELS", 20)
 QUALITY_MIN_RECALL = env_float("RAG_QUALITY_MIN_RECALL", 0.90)
 
+# Concurrent search and ingestion. Auto mode measures *free* VRAM after the
+# search runtime is loaded; total VRAM alone does not tell us whether both jobs
+# fit at a particular moment.
+SEARCH_DURING_INGESTION = os.environ.get(
+    "RAG_SEARCH_DURING_INGESTION",
+    "auto",
+).strip().lower()
+if SEARCH_DURING_INGESTION not in {"auto", "never", "always"}:
+    raise ValueError(
+        "RAG_SEARCH_DURING_INGESTION must be auto, never, or always."
+    )
+DOCLING_GPU_HEADROOM_MB = env_int(
+    "RAG_GPU_HEADROOM_WARNING_MB",
+    env_int("RAG_CUDA_HEADROOM_WARNING_MB", 3500),
+)
+CONCURRENT_QUERY_RESERVE_MB = env_int(
+    "RAG_CONCURRENT_QUERY_RESERVE_MB",
+    768,
+)
+
 # Presentation, diagnostics, and local server
 MAX_CHARS_PER_RESULT = env_int("RAG_MAX_RESULT_CHARS", 6000)
 DEBUG_RETRIEVAL = env_flag("RAG_DEBUG_RETRIEVAL", False)

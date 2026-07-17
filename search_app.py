@@ -51,8 +51,10 @@ from transformers import (
 
 from app_settings import (
     ADDITIONAL_RESULTS,
+    CONCURRENT_QUERY_RESERVE_MB,
     DEBUG_RETRIEVAL,
     DENSE_CANDIDATES,
+    DOCLING_GPU_HEADROOM_MB,
     ENABLE_RELEVANCE_GATE,
     LEXICAL_CANDIDATES,
     MAX_CHARS_PER_RESULT,
@@ -76,6 +78,7 @@ from app_settings import (
     RERANKER_REVISION,
     RERANKER_USE_AUTH,
     RRF_K,
+    SEARCH_DURING_INGESTION,
     SERVER_HOST,
     SERVER_PORT,
     reranker_fingerprint,
@@ -475,11 +478,97 @@ _DOCUMENT_JOB: dict[str, Any] = {
     "finished_at": None,
     "force": False,
     "pause_requested": False,
+    "search_available": False,
+    "concurrency_reason": "No indexing job is running.",
 }
 
 
 class DocumentMaintenanceError(RuntimeError):
     """Raised when a search is attempted during an index update."""
+
+
+def _gpu_memory_mib() -> tuple[int, int] | None:
+    """Return currently free and total accelerator memory, when available."""
+
+    if COMPUTE_BACKEND not in {"cuda", "rocm"} or not torch.cuda.is_available():
+        return None
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except (RuntimeError, OSError):
+        return None
+    return (
+        int(free_bytes // (1024 * 1024)),
+        int(total_bytes // (1024 * 1024)),
+    )
+
+
+def concurrent_ingestion_policy() -> tuple[bool, str]:
+    """Decide whether a loaded search runtime can remain active for ingestion."""
+
+    if SEARCH_DURING_INGESTION == "never":
+        return False, "Concurrent search is disabled by configuration."
+    with _RUNTIME_LOCK:
+        runtime_loaded = _RUNTIME is not None
+    if not runtime_loaded:
+        return False, "Search is not loaded yet, so indexing uses exclusive mode."
+    if SEARCH_DURING_INGESTION == "always":
+        return True, "Concurrent search was explicitly forced by configuration."
+
+    memory = _gpu_memory_mib()
+    if memory is None:
+        return False, "Auto mode requires a supported GPU with memory reporting."
+    free_mb, total_mb = memory
+    required_mb = DOCLING_GPU_HEADROOM_MB + CONCURRENT_QUERY_RESERVE_MB
+    if free_mb < required_mb:
+        return (
+            False,
+            f"GPU has {free_mb} MiB free; Docling and a live query need "
+            f"about {required_mb} MiB (Docling {DOCLING_GPU_HEADROOM_MB} + "
+            f"query reserve {CONCURRENT_QUERY_RESERVE_MB}).",
+        )
+    return (
+        True,
+        f"GPU has {free_mb} MiB free of {total_mb} MiB; concurrent reserve is "
+        f"{required_mb} MiB.",
+    )
+
+
+def _concurrent_search_is_safe() -> tuple[bool, str]:
+    """Avoid a new rerank batch when ingestion has exhausted GPU headroom."""
+
+    if SEARCH_DURING_INGESTION == "always":
+        return True, "Concurrent search was explicitly forced by configuration."
+    memory = _gpu_memory_mib()
+    if memory is None:
+        return False, "GPU memory is not available for a concurrent query."
+    free_mb, _ = memory
+    if free_mb < CONCURRENT_QUERY_RESERVE_MB:
+        return (
+            False,
+            f"Indexing currently leaves only {free_mb} MiB of GPU memory free.",
+        )
+    return True, "GPU headroom is available."
+
+
+def _guard_search_during_ingestion() -> None:
+    job = document_job_snapshot()
+    if not job.get("running"):
+        return
+    if not job.get("search_available"):
+        raise DocumentMaintenanceError(
+            "The document index is being updated. Search will resume when it finishes."
+        )
+    with _RUNTIME_LOCK:
+        runtime_loaded = _RUNTIME is not None
+    if not runtime_loaded:
+        raise DocumentMaintenanceError(
+            "The search runtime is restarting during indexing. Try again shortly."
+        )
+    safe, reason = _concurrent_search_is_safe()
+    if not safe:
+        raise DocumentMaintenanceError(
+            f"Search is temporarily paused while indexing: {reason}"
+        )
 
 
 def document_job_snapshot() -> dict[str, Any]:
@@ -650,82 +739,114 @@ def schedule_application_restart() -> dict[str, Any]:
     return {"restarting": True, "instance_id": previous_instance_id}
 
 
-def _run_document_index_job(force: bool) -> None:
-    _update_document_job(state="waiting", message="Waiting for active searches to finish")
+def _run_document_index_job(
+    force: bool,
+    search_available: bool = False,
+) -> None:
+    _update_document_job(
+        state="waiting",
+        message=(
+            "Preparing concurrent indexing while search stays available."
+            if search_available
+            else "Waiting for active searches to finish."
+        ),
+    )
     exit_code = -1
     try:
-        with _SEARCH_MAINTENANCE_LOCK:
-            _update_document_job(state="preparing", message="Releasing search models and GPU memory")
-            _release_search_runtime()
-            _unload_ollama_embedding_model()
+        if search_available:
+            _update_document_job(
+                state="preparing",
+                message="Keeping the loaded search runtime; checking GPU headroom.",
+            )
+        else:
+            with _SEARCH_MAINTENANCE_LOCK:
+                _update_document_job(
+                    state="preparing",
+                    message="Releasing search models and GPU memory.",
+                )
+                _release_search_runtime()
+                _unload_ollama_embedding_model()
 
-            managed_queue = (
-                hasattr(DOCUMENT_REPOSITORY, "clear_pending_sources")
-                and CORPUS_SCALE.repository is DOCUMENT_REPOSITORY
+        managed_queue = (
+            hasattr(DOCUMENT_REPOSITORY, "clear_pending_sources")
+            and CORPUS_SCALE.repository is DOCUMENT_REPOSITORY
+        )
+        command = [sys.executable, str(Path(__file__).with_name("ingest.py")), "--prune"]
+        if managed_queue:
+            command.extend(
+                ("--queue-managed", "--queue-control", str(CORPUS_SCALE.state_path))
             )
-            command = [sys.executable, str(Path(__file__).with_name("ingest.py")), "--prune"]
-            if managed_queue:
-                command.extend(
-                    ("--queue-managed", "--queue-control", str(CORPUS_SCALE.state_path))
-                )
-                prune_command = list(command)
-                for source_id in CORPUS_SCALE.queued_sources():
-                    command.extend(("--source", source_id))
-            if force:
-                command.append("--force")
-            environment = os.environ.copy()
-            environment["RAG_OPEN_BROWSER"] = "0"
-            _update_document_job(state="running", message="Starting document ingestion")
-            process = subprocess.Popen(
-                command,
-                cwd=str(Path(__file__).resolve().parent),
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=_subprocess_creation_flags(),
+            prune_command = list(command)
+            for source_id in CORPUS_SCALE.queued_sources():
+                command.extend(("--source", source_id))
+        if force:
+            command.append("--force")
+        environment = os.environ.copy()
+        environment["RAG_OPEN_BROWSER"] = "0"
+        if search_available:
+            # Docling independently refuses to start if real free VRAM falls
+            # below this combined reserve after the child process starts.
+            environment["RAG_GPU_HEADROOM_WARNING_MB"] = str(
+                DOCLING_GPU_HEADROOM_MB + CONCURRENT_QUERY_RESERVE_MB
             )
-            assert process.stdout is not None
-            structured_events = False
-            for line in process.stdout:
-                if _handle_corpus_event(line):
-                    structured_events = True
-                else:
-                    _append_document_job_log(line)
-            exit_code = process.wait()
-            if exit_code != 0 and managed_queue:
-                queue_after_run = CORPUS_SCALE.snapshot()
-                quarantine_count = int(
-                    queue_after_run.get("counts", {}).get("quarantined", 0)
+        _update_document_job(
+            state="running",
+            message=(
+                "Indexing documents. Search remains available while GPU headroom permits."
+                if search_available
+                else "Starting document ingestion."
+            ),
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parent),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=_subprocess_creation_flags(),
+        )
+        assert process.stdout is not None
+        structured_events = False
+        for line in process.stdout:
+            if _handle_corpus_event(line):
+                structured_events = True
+            else:
+                _append_document_job_log(line)
+        exit_code = process.wait()
+        if exit_code != 0 and managed_queue:
+            queue_after_run = CORPUS_SCALE.snapshot()
+            quarantine_count = int(
+                queue_after_run.get("counts", {}).get("quarantined", 0)
+            )
+            if quarantine_count and (
+                not queue_after_run.get("remaining")
+                or exit_code == PAUSED_EXIT_CODE
+            ):
+                _append_document_job_log(
+                    "Finalizing the index after quarantining failed documents."
                 )
-                if quarantine_count and (
-                    not queue_after_run.get("remaining")
-                    or exit_code == PAUSED_EXIT_CODE
-                ):
-                    _append_document_job_log(
-                        "Finalizing the index after quarantining failed documents."
-                    )
-                    prune_process = subprocess.Popen(
-                        prune_command,
-                        cwd=str(Path(__file__).resolve().parent),
-                        env=environment,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        bufsize=1,
-                        creationflags=_subprocess_creation_flags(),
-                    )
-                    assert prune_process.stdout is not None
-                    for line in prune_process.stdout:
-                        if not _handle_corpus_event(line):
-                            _append_document_job_log(line)
-                    if prune_process.wait() == 0 and exit_code != PAUSED_EXIT_CODE:
-                        exit_code = 0
+                prune_process = subprocess.Popen(
+                    prune_command,
+                    cwd=str(Path(__file__).resolve().parent),
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=_subprocess_creation_flags(),
+                )
+                assert prune_process.stdout is not None
+                for line in prune_process.stdout:
+                    if not _handle_corpus_event(line):
+                        _append_document_job_log(line)
+                if prune_process.wait() == 0 and exit_code != PAUSED_EXIT_CODE:
+                    exit_code = 0
 
         if exit_code == 0:
             completed_deletions = (
@@ -787,6 +908,7 @@ def start_document_index_job(
     *,
     resume: bool = False,
 ) -> dict[str, Any]:
+    search_available, concurrency_reason = concurrent_ingestion_policy()
     with _DOCUMENT_JOB_LOCK:
         if _DOCUMENT_JOB.get("running"):
             raise RuntimeError("A document index update is already running.")
@@ -809,12 +931,17 @@ def start_document_index_job(
                 "finished_at": None,
                 "force": bool(force),
                 "pause_requested": False,
+                "search_available": search_available,
+                "concurrency_reason": concurrency_reason,
             }
         )
-        _DOCUMENT_MAINTENANCE.set()
+        if search_available:
+            _DOCUMENT_MAINTENANCE.clear()
+        else:
+            _DOCUMENT_MAINTENANCE.set()
     threading.Thread(
         target=_run_document_index_job,
-        args=(bool(force),),
+        args=(bool(force), search_available),
         name="document-index-job",
         daemon=True,
     ).start()
@@ -879,12 +1006,14 @@ def get_runtime() -> Runtime:
         raise DocumentMaintenanceError(
             "The document index is being updated. Search will resume automatically when it finishes."
         )
+    _guard_search_during_ingestion()
     if _RUNTIME is None:
         with _RUNTIME_LOCK:
             if _DOCUMENT_MAINTENANCE.is_set():
                 raise DocumentMaintenanceError(
                     "The document index is being updated. Search will resume automatically when it finishes."
                 )
+            _guard_search_during_ingestion()
             if _RUNTIME is None:
                 _RUNTIME = build_runtime()
     return _RUNTIME
@@ -2933,11 +3062,13 @@ def search_with_additional(
         raise DocumentMaintenanceError(
             "The document index is being updated. Search will resume when it finishes."
         )
+    _guard_search_during_ingestion()
     with _SEARCH_MAINTENANCE_LOCK:
         if _DOCUMENT_MAINTENANCE.is_set():
             raise DocumentMaintenanceError(
                 "The document index is being updated. Search will resume when it finishes."
             )
+        _guard_search_during_ingestion()
         return _search_with_additional_unlocked(
             question,
             source_filter,

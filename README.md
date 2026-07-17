@@ -178,9 +178,17 @@ available as a fallback.
 
 ### The app reports insufficient GPU memory
 
-The supported target is at least 8 GB VRAM. Close other GPU-heavy applications
-and retry. The document manager automatically releases search models before
-starting ingestion.
+Close other GPU-heavy applications and retry. The document manager measures
+free VRAM and automatically releases search models before ingestion when both
+workloads do not fit at that moment.
+
+### Search pauses while documents are indexing
+
+By default, Reference Desk measures free GPU memory after search models are
+loaded. It keeps search available only when that free memory covers Docling's
+configured headroom plus a small live-query reserve. It does not rely on a
+fixed VRAM size. Set `RAG_SEARCH_DURING_INGESTION=always` only if you want to
+override that safety calculation; `never` restores strictly exclusive indexing.
 
 ### Check the installation
 
