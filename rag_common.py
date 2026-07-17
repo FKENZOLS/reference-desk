@@ -38,9 +38,9 @@ DEBUG_DIR = _configured_path("RAG_DEBUG_DIR", "ingestion_debug")
 MANIFEST_PATH = _configured_path("RAG_MANIFEST_PATH", "chroma_db/ingestion_manifest.json")
 LEXICAL_DB_PATH = _configured_path("RAG_LEXICAL_DB_PATH", "chroma_db/lexical.sqlite3")
 
-COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "technical_docs_v3")
+COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "technical_docs_qwen_v1")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "embeddinggemma:latest")
+EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 
 # PyTorch ROCm intentionally uses the same ``torch.cuda`` device strings as
 # NVIDIA CUDA. Keep the vendor backend separate from the physical device name.
@@ -93,11 +93,15 @@ OLLAMA_KEEP_ALIVE = int(os.environ.get("RAG_OLLAMA_KEEP_ALIVE", "300"))
 # model changes, update this value and rebuild the collection.
 _EXPLICIT_EMBEDDING_REVISION = os.environ.get("RAG_EMBEDDING_MODEL_REVISION")
 EMBEDDING_MODEL_REVISION = _EXPLICIT_EMBEDDING_REVISION or EMBEDDING_MODEL
-EMBEDDING_DIMENSION = int(os.environ.get("RAG_EMBEDDING_DIMENSION", "768"))
-EMBEDDING_PROMPT_VERSION = "embeddinggemma-retrieval-v1"
+EMBEDDING_DIMENSION = int(os.environ.get("RAG_EMBEDDING_DIMENSION", "1024"))
+EMBEDDING_PROMPT_VERSION = "qwen3-technical-retrieval-v1"
 
-DOCUMENT_PREFIX_TEMPLATE = "title: {title} | text: {text}"
-QUERY_PREFIX_TEMPLATE = "task: search result | query: {query}"
+DOCUMENT_PREFIX_TEMPLATE = "Document title: {title}\n{text}"
+QUERY_PREFIX_TEMPLATE = (
+    "Instruct: Given a technical-document search query, retrieve passages that "
+    "directly define, specify, explain, or constrain the requested subject.\n"
+    "Query: {query}"
+)
 
 
 def stable_fingerprint(values: dict[str, object]) -> str:
@@ -154,8 +158,8 @@ def clean_title(title: str | None) -> str:
     return value[:300] or "none"
 
 
-class EmbeddingGemmaOllamaEmbeddings(Embeddings):
-    """EmbeddingGemma prompts shared by ingestion and retrieval."""
+class OllamaRetrievalEmbeddings(Embeddings):
+    """Qwen retrieval prompts shared by ingestion and search."""
 
     def __init__(
         self,
@@ -216,5 +220,9 @@ class EmbeddingGemmaOllamaEmbeddings(Embeddings):
             )
 
 
-def create_embeddings() -> EmbeddingGemmaOllamaEmbeddings:
-    return EmbeddingGemmaOllamaEmbeddings()
+def create_embeddings() -> OllamaRetrievalEmbeddings:
+    return OllamaRetrievalEmbeddings()
+
+
+# Compatibility for extensions importing the former implementation name.
+EmbeddingGemmaOllamaEmbeddings = OllamaRetrievalEmbeddings

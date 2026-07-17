@@ -1,7 +1,8 @@
 {
-  "name": "document-reference-ui",
+  "name": "reference-desk-ui",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.1.1",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",

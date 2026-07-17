@@ -138,7 +138,7 @@ def test_cuda_oom_is_recognized_and_reports_recovery(tmp_path) -> None:
     assert is_cuda_out_of_memory("HIP out of memory on AMD device")
     assert is_cuda_out_of_memory("HSA_STATUS_ERROR_OUT_OF_RESOURCES")
     assert not is_cuda_out_of_memory("std::bad_alloc")
-    with pytest.raises(RuntimeError, match="ollama stop embeddinggemma"):
+    with pytest.raises(RuntimeError, match=r"ollama stop qwen3-embedding:0\.6b"):
         convert_page_range_resilient(
             OomConverter(),
             tmp_path / "large.pdf",
@@ -156,5 +156,5 @@ def test_low_cuda_headroom_stops_before_conversion(monkeypatch) -> None:
         "ingest.torch.cuda.mem_get_info",
         lambda: (2800 * 1024 * 1024, 6144 * 1024 * 1024),
     )
-    with pytest.raises(RuntimeError, match="ollama stop embeddinggemma"):
+    with pytest.raises(RuntimeError, match=r"ollama stop qwen3-embedding:0\.6b"):
         report_cuda_headroom()

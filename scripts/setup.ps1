@@ -50,10 +50,15 @@ if ($LASTEXITCODE -ne 0) { throw "The $Selected PyTorch installation failed." }
 if ($LASTEXITCODE -ne 0) { throw "The application dependency installation failed." }
 Set-Content -LiteralPath ".rag-profile" -Value $Selected -Encoding ascii
 
+& $VenvPython scripts\cache_models.py
+if ($LASTEXITCODE -ne 0) {
+    throw "The public Qwen tokenizer or reranker could not be downloaded. Check the internet connection and retry."
+}
+
 if (Get-Command ollama -ErrorAction SilentlyContinue) {
-    if (-not $SkipOllamaPull) { & ollama pull embeddinggemma }
+    if (-not $SkipOllamaPull) { & ollama pull qwen3-embedding:0.6b }
 } else {
-    Write-Host "Ollama was not found. Install it, then run: ollama pull embeddinggemma" -ForegroundColor Yellow
+    Write-Host "Ollama was not found. Install it, then run: ollama pull qwen3-embedding:0.6b" -ForegroundColor Yellow
 }
 
 & $VenvPython scripts\doctor.py --expect $Selected

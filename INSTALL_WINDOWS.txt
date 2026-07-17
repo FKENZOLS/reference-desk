@@ -49,7 +49,7 @@ Common problems
   the computer and run SETUP.bat again.
 
 "Ollama is unavailable"
-  Start Ollama, open Command Prompt, and run: ollama pull embeddinggemma
+  Start Ollama, open Command Prompt, and run: ollama pull qwen3-embedding:0.6b
 
 "Out of memory"
   Close games, AI tools, and other GPU-heavy applications, then try again.

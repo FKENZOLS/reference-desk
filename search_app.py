@@ -1,4 +1,4 @@
-"""Local hybrid document retrieval and BGE reranking application.
+"""Local hybrid document retrieval and Qwen reranking application.
 
 The application deliberately performs retrieval only. It does not generate an
 answer and does not rewrite the user's query with an LLM.
@@ -43,7 +43,11 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+)
 
 from app_settings import (
     ADDITIONAL_RESULTS,
@@ -63,14 +67,19 @@ from app_settings import (
     QUALITY_MIN_RECALL,
     RERANK_BATCH_SIZE,
     RERANK_CANDIDATES,
+    RERANK_INSTRUCTION,
     RERANK_MAX_LENGTH,
     RERANK_TOP_N,
     RERANK_USE_FP16,
     RERANK_WEIGHT,
     RERANKER_MODEL,
+    RERANKER_REVISION,
+    RERANKER_USE_AUTH,
     RRF_K,
     SERVER_HOST,
     SERVER_PORT,
+    reranker_fingerprint,
+    resolve_reranker_backend,
 )
 from lexical_index import rebuild_from_collection
 from lexical_index import fingerprint_ids as fingerprint_lexical_ids
@@ -151,12 +160,22 @@ class RetrievalFilters:
 class Runtime:
     collection: Any
     vectorstore: Chroma
-    reranker: "BGEReranker"
+    reranker: "LocalReranker"
     inference_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-class BGEReranker:
-    """Local multilingual BGE cross-encoder with truncation diagnostics."""
+class LocalReranker:
+    """Qwen yes/no reranker with an optional classifier compatibility path."""
+
+    QWEN_PREFIX = (
+        "<|im_start|>system\n"
+        "Judge whether the Document meets the requirements based on the Query "
+        "and the Instruct provided. Note that the answer can only be \"yes\" "
+        "or \"no\".<|im_end|>\n<|im_start|>user\n"
+    )
+    QWEN_SUFFIX = (
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
 
     def __init__(
         self,
@@ -165,25 +184,69 @@ class BGEReranker:
         batch_size: int = RERANK_BATCH_SIZE,
         use_fp16: bool = RERANK_USE_FP16,
         device: str = RERANKER_DEVICE,
+        revision: str = RERANKER_REVISION,
+        instruction: str = RERANK_INSTRUCTION,
     ) -> None:
         self.model_name = model_name
         self.max_length = max_length
         self.batch_size = batch_size
         self.device = resolve_torch_device(device)
+        self.backend = resolve_reranker_backend(model_name)
+        self.instruction = instruction
+        model_token: bool = True if RERANKER_USE_AUTH else False
 
-        LOGGER.info("Loading reranker %s on %s", model_name, self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        LOGGER.info(
+            "Loading reranker %s (%s) on %s",
+            model_name,
+            self.backend,
+            self.device,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            revision=revision,
+            padding_side="left" if self.backend == "qwen-causal-lm" else "right",
+            token=model_token,
+        )
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         model_dtype = (
             torch.float16
             if self.device.type == "cuda" and use_fp16
             else torch.float32
         )
-        self.model = AutoModelForSequenceClassification.from_pretrained(
+        model_class = (
+            AutoModelForCausalLM
+            if self.backend == "qwen-causal-lm"
+            else AutoModelForSequenceClassification
+        )
+        self.model = model_class.from_pretrained(
             model_name,
+            revision=revision,
             dtype=model_dtype,
+            token=model_token,
         )
         self.model.to(self.device)
         self.model.eval()
+
+        if self.backend == "qwen-causal-lm":
+            self._prefix_ids = self.tokenizer.encode(
+                self.QWEN_PREFIX,
+                add_special_tokens=False,
+            )
+            self._suffix_ids = self.tokenizer.encode(
+                self.QWEN_SUFFIX,
+                add_special_tokens=False,
+            )
+            self._no_token_id = self.tokenizer.convert_tokens_to_ids("no")
+            self._yes_token_id = self.tokenizer.convert_tokens_to_ids("yes")
+            if self._no_token_id == self.tokenizer.unk_token_id or self._yes_token_id == self.tokenizer.unk_token_id:
+                raise RuntimeError("Qwen reranker tokenizer does not expose yes/no tokens.")
+            body_budget = self.max_length - len(self._prefix_ids) - len(self._suffix_ids)
+            if body_budget < 32:
+                raise ValueError(
+                    "RAG_RERANK_MAX_LENGTH is too small for the Qwen reranker prompt."
+                )
+            self._body_budget = body_budget
 
     def predict(
         self,
@@ -191,6 +254,80 @@ class BGEReranker:
     ) -> list[tuple[float, float, int, bool]]:
         if not pairs:
             return []
+
+        if self.backend == "qwen-causal-lm":
+            return self._predict_qwen(pairs)
+        return self._predict_classifier(pairs)
+
+    def _predict_qwen(
+        self,
+        pairs: Sequence[tuple[str, str]],
+    ) -> list[tuple[float, float, int, bool]]:
+        output: list[tuple[float, float, int, bool]] = []
+        for start in range(0, len(pairs), self.batch_size):
+            batch = pairs[start : start + self.batch_size]
+            bodies = [
+                (
+                    f"<Instruct>: {self.instruction}\n"
+                    f"<Query>: {query}\n"
+                    f"<Document>: {passage}"
+                )
+                for query, passage in batch
+            ]
+            untruncated = self.tokenizer(
+                bodies,
+                padding=False,
+                truncation=False,
+                add_special_tokens=False,
+            )["input_ids"]
+            overhead = len(self._prefix_ids) + len(self._suffix_ids)
+            token_counts = [overhead + len(input_ids) for input_ids in untruncated]
+            body_ids = self.tokenizer(
+                bodies,
+                padding=False,
+                truncation=True,
+                max_length=self._body_budget,
+                add_special_tokens=False,
+            )["input_ids"]
+            encoded = self.tokenizer.pad(
+                {
+                    "input_ids": [
+                        self._prefix_ids + input_ids + self._suffix_ids
+                        for input_ids in body_ids
+                    ]
+                },
+                padding=True,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(self.device) for key, value in encoded.items()}
+
+            with torch.inference_mode():
+                final_logits = self.model(**encoded).logits[:, -1, :].float()
+                no_logits = final_logits[:, self._no_token_id]
+                yes_logits = final_logits[:, self._yes_token_id]
+                log_odds = yes_logits - no_logits
+                probabilities = torch.sigmoid(log_odds)
+
+            for logit, probability, token_count in zip(
+                log_odds.cpu().tolist(),
+                probabilities.cpu().tolist(),
+                token_counts,
+                strict=True,
+            ):
+                output.append(
+                    (
+                        float(logit),
+                        float(probability),
+                        token_count,
+                        token_count > self.max_length,
+                    )
+                )
+        return output
+
+    def _predict_classifier(
+        self,
+        pairs: Sequence[tuple[str, str]],
+    ) -> list[tuple[float, float, int, bool]]:
 
         output: list[tuple[float, float, int, bool]] = []
         for start in range(0, len(pairs), self.batch_size):
@@ -236,6 +373,10 @@ class BGEReranker:
                     )
                 )
         return output
+
+
+# Compatibility for local extensions that imported the previous class name.
+BGEReranker = LocalReranker
 
 
 def resolve_torch_device(configured: str) -> torch.device:
@@ -728,7 +869,7 @@ def build_runtime() -> Runtime:
     return Runtime(
         collection=collection,
         vectorstore=vectorstore,
-        reranker=BGEReranker(),
+        reranker=LocalReranker(),
     )
 
 
@@ -1087,6 +1228,8 @@ def relevance_gate_thresholds() -> tuple[float, float, str] | None:
         calibration = WORKSPACE_STORE.calibration_status(
             min_positive=QUALITY_MIN_POSITIVE_LABELS,
             min_negative=QUALITY_MIN_NEGATIVE_LABELS,
+            reranker_model=RERANKER_MODEL,
+            reranker_fingerprint=reranker_fingerprint(),
         )
     except Exception:
         LOGGER.exception("Could not read the reference-quality calibration")
@@ -2528,6 +2671,8 @@ def candidate_feedback_payload(
         "result_rank": candidate.final_rank,
         "rerank_logit": candidate.rerank_logit,
         "final_score": candidate.final_score,
+        "reranker_model": RERANKER_MODEL,
+        "reranker_fingerprint": reranker_fingerprint(),
         **(context or {}),
     }
 
@@ -3752,6 +3897,8 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         summary = WORKSPACE_STORE.quality_summary(
             min_positive=QUALITY_MIN_POSITIVE_LABELS,
             min_negative=QUALITY_MIN_NEGATIVE_LABELS,
+            reranker_model=RERANKER_MODEL,
+            reranker_fingerprint=reranker_fingerprint(),
         )
         return frontend_page(
             quality_dashboard_html(
@@ -3766,16 +3913,20 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             "summary": WORKSPACE_STORE.quality_summary(
                 min_positive=QUALITY_MIN_POSITIVE_LABELS,
                 min_negative=QUALITY_MIN_NEGATIVE_LABELS,
+                reranker_model=RERANKER_MODEL,
+                reranker_fingerprint=reranker_fingerprint(),
             ),
             "feedback": WORKSPACE_STORE.list_feedback(limit=300),
         }
 
     @app.post("/quality/api/feedback", include_in_schema=False)
     async def save_retrieval_feedback(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+        payload = dict(await request.json())
+        payload["reranker_model"] = RERANKER_MODEL
+        payload["reranker_fingerprint"] = reranker_fingerprint()
         try:
             feedback = WORKSPACE_STORE.upsert_feedback(
-                dict(payload),
+                payload,
                 min_positive=QUALITY_MIN_POSITIVE_LABELS,
                 min_negative=QUALITY_MIN_NEGATIVE_LABELS,
                 min_recall=QUALITY_MIN_RECALL,
@@ -3787,6 +3938,8 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             "calibration": WORKSPACE_STORE.calibration_status(
                 min_positive=QUALITY_MIN_POSITIVE_LABELS,
                 min_negative=QUALITY_MIN_NEGATIVE_LABELS,
+                reranker_model=RERANKER_MODEL,
+                reranker_fingerprint=reranker_fingerprint(),
             ),
         }
 
@@ -3808,6 +3961,8 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             min_positive=QUALITY_MIN_POSITIVE_LABELS,
             min_negative=QUALITY_MIN_NEGATIVE_LABELS,
             min_recall=QUALITY_MIN_RECALL,
+            reranker_model=RERANKER_MODEL,
+            reranker_fingerprint=reranker_fingerprint(),
         )
 
     @app.patch("/quality/api/calibration", include_in_schema=False)
@@ -3817,10 +3972,16 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         payload = await request.json()
         if "enabled" not in payload:
             raise HTTPException(status_code=400, detail="enabled is required")
-        WORKSPACE_STORE.set_calibration_enabled(bool(payload["enabled"]))
+        WORKSPACE_STORE.set_calibration_enabled(
+            bool(payload["enabled"]),
+            reranker_model=RERANKER_MODEL,
+            reranker_fingerprint=reranker_fingerprint(),
+        )
         return WORKSPACE_STORE.calibration_status(
             min_positive=QUALITY_MIN_POSITIVE_LABELS,
             min_negative=QUALITY_MIN_NEGATIVE_LABELS,
+            reranker_model=RERANKER_MODEL,
+            reranker_fingerprint=reranker_fingerprint(),
         )
 
     @app.get("/quality/export/benchmark", include_in_schema=False)

@@ -30,11 +30,12 @@ case "$BACKEND" in
 esac
 "$VPY" -m pip install -r requirements-base.txt
 printf '%s\n' "$BACKEND" > .rag-profile
+"$VPY" scripts/cache_models.py
 
 if command -v ollama >/dev/null 2>&1; then
-  ollama pull embeddinggemma
+  ollama pull qwen3-embedding:0.6b
 else
-  echo "Ollama was not found. Install it, then run: ollama pull embeddinggemma"
+  echo "Ollama was not found. Install it, then run: ollama pull qwen3-embedding:0.6b"
 fi
 
 "$VPY" scripts/doctor.py --expect "$BACKEND"

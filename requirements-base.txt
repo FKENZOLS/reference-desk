@@ -3,6 +3,7 @@ docling>=2.40,<3
 docling-core>=2.40,<3
 fastapi>=0.115,<1
 gradio>=5,<7
+huggingface-hub>=0.34,<2
 langchain-chroma>=0.2,<2
 langchain-core>=0.3,<2
 langchain-ollama>=0.3,<2

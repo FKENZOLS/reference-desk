@@ -111,10 +111,63 @@ def test_calibration_waits_for_both_classes_and_can_be_paused(tmp_path) -> None:
     assert store.calibration_status(min_positive=2, min_negative=2)["active"] is False
 
 
+def test_calibration_is_kept_separate_for_each_reranker(tmp_path) -> None:
+    store = WorkspaceStore(tmp_path / "quality.sqlite3")
+    for fingerprint, positive, negative in (
+        ("qwen-fingerprint", 2.0, -1.0),
+        ("bge-fingerprint", 4.0, -3.0),
+    ):
+        model = "qwen" if fingerprint.startswith("qwen") else "bge"
+        store.upsert_feedback(
+            feedback_payload(
+                query=f"{model} positive",
+                chunk_id=f"{model}-positive",
+                rerank_logit=positive,
+                reranker_model=model,
+                reranker_fingerprint=fingerprint,
+            ),
+            min_positive=1,
+            min_negative=1,
+        )
+        store.upsert_feedback(
+            feedback_payload(
+                query=f"{model} negative",
+                judgment="wrong_passage",
+                chunk_id=f"{model}-negative",
+                rerank_logit=negative,
+                reranker_model=model,
+                reranker_fingerprint=fingerprint,
+            ),
+            min_positive=1,
+            min_negative=1,
+        )
+
+    qwen = store.calibration_status(
+        min_positive=1,
+        min_negative=1,
+        reranker_model="qwen",
+        reranker_fingerprint="qwen-fingerprint",
+    )
+    bge = store.calibration_status(
+        min_positive=1,
+        min_negative=1,
+        reranker_model="bge",
+        reranker_fingerprint="bge-fingerprint",
+    )
+    assert qwen["active"] is True
+    assert qwen["threshold"] == 2.0
+    assert bge["active"] is True
+    assert bge["threshold"] == 4.0
+
+
 def test_feedback_calibration_drives_live_result_rejection(tmp_path, monkeypatch) -> None:
     store = WorkspaceStore(tmp_path / "quality.sqlite3")
+    model_fields = {
+        "reranker_model": search_app.RERANKER_MODEL,
+        "reranker_fingerprint": search_app.reranker_fingerprint(),
+    }
     store.upsert_feedback(
-        feedback_payload(rerank_logit=2.0),
+        feedback_payload(rerank_logit=2.0, **model_fields),
         min_positive=1,
         min_negative=1,
     )
@@ -124,6 +177,7 @@ def test_feedback_calibration_drives_live_result_rejection(tmp_path, monkeypatch
             judgment="wrong_document",
             chunk_id="negative",
             rerank_logit=-1.0,
+            **model_fields,
         ),
         min_positive=1,
         min_negative=1,

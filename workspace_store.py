@@ -116,6 +116,8 @@ class WorkspaceStore:
                     result_rank INTEGER,
                     rerank_logit REAL,
                     final_score REAL,
+                    reranker_model TEXT NOT NULL DEFAULT '',
+                    reranker_fingerprint TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(
@@ -126,6 +128,22 @@ class WorkspaceStore:
 
                 CREATE TABLE IF NOT EXISTS quality_calibration (
                     id INTEGER PRIMARY KEY CHECK(id = 1),
+                    threshold REAL,
+                    positive_count INTEGER NOT NULL DEFAULT 0,
+                    negative_count INTEGER NOT NULL DEFAULT 0,
+                    positive_recall REAL,
+                    specificity REAL,
+                    balanced_accuracy REAL,
+                    ready INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    reranker_model TEXT NOT NULL DEFAULT '',
+                    reranker_fingerprint TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS quality_calibration_v2 (
+                    reranker_fingerprint TEXT PRIMARY KEY,
+                    reranker_model TEXT NOT NULL DEFAULT '',
                     threshold REAL,
                     positive_count INTEGER NOT NULL DEFAULT 0,
                     negative_count INTEGER NOT NULL DEFAULT 0,
@@ -146,6 +164,65 @@ class WorkspaceStore:
                 CREATE INDEX IF NOT EXISTS idx_feedback_judgment
                     ON retrieval_feedback(judgment, updated_at DESC);
                 """
+            )
+            self._ensure_column(
+                connection,
+                "retrieval_feedback",
+                "reranker_model",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "retrieval_feedback",
+                "reranker_fingerprint",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "quality_calibration",
+                "reranker_model",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "quality_calibration",
+                "reranker_fingerprint",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feedback_reranker
+                ON retrieval_feedback(reranker_fingerprint, updated_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO quality_calibration_v2(
+                    reranker_fingerprint, reranker_model, threshold,
+                    positive_count, negative_count, positive_recall,
+                    specificity, balanced_accuracy, ready, enabled, updated_at
+                )
+                SELECT reranker_fingerprint, reranker_model, threshold,
+                       positive_count, negative_count, positive_recall,
+                       specificity, balanced_accuracy, ready, enabled, updated_at
+                FROM quality_calibration WHERE id = 1
+                """
+            )
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
             )
 
     @staticmethod
@@ -435,6 +512,10 @@ class WorkspaceStore:
         section_filter = str(payload.get("section_filter") or "").strip()[:1000]
         content_filter = str(payload.get("content_filter") or "").strip()[:100]
         date_filter = str(payload.get("date_filter") or "").strip()[:100]
+        reranker_model = str(payload.get("reranker_model") or "").strip()[:500]
+        reranker_fingerprint = str(
+            payload.get("reranker_fingerprint") or ""
+        ).strip()[:128]
         now = utc_now()
         values = (
             query,
@@ -454,6 +535,8 @@ class WorkspaceStore:
             _optional_positive_int(payload.get("result_rank")),
             _optional_finite_float(payload.get("rerank_logit")),
             _optional_finite_float(payload.get("final_score")),
+            reranker_model,
+            reranker_fingerprint,
             now,
             now,
         )
@@ -464,8 +547,9 @@ class WorkspaceStore:
                     query, target_key, judgment, chunk_id, source_id,
                     document_title, page_start, page_end, section, excerpt,
                     source_filter, section_filter, content_filter, date_filter,
-                    result_rank, rerank_logit, final_score, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    result_rank, rerank_logit, final_score, reranker_model,
+                    reranker_fingerprint, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(
                     query, source_filter, section_filter, content_filter,
                     date_filter, target_key
@@ -481,6 +565,8 @@ class WorkspaceStore:
                     result_rank = excluded.result_rank,
                     rerank_logit = excluded.rerank_logit,
                     final_score = excluded.final_score,
+                    reranker_model = excluded.reranker_model,
+                    reranker_fingerprint = excluded.reranker_fingerprint,
                     updated_at = excluded.updated_at
                 """,
                 values,
@@ -504,6 +590,8 @@ class WorkspaceStore:
             min_positive=min_positive,
             min_negative=min_negative,
             min_recall=min_recall,
+            reranker_model=reranker_model,
+            reranker_fingerprint=reranker_fingerprint,
         )
         assert row is not None
         return dict(row)
@@ -541,6 +629,13 @@ class WorkspaceStore:
         min_recall: float = 0.90,
     ) -> bool:
         with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT reranker_model, reranker_fingerprint
+                FROM retrieval_feedback WHERE id = ?
+                """,
+                (int(feedback_id),),
+            ).fetchone()
             cursor = connection.execute(
                 "DELETE FROM retrieval_feedback WHERE id = ?",
                 (int(feedback_id),),
@@ -550,6 +645,10 @@ class WorkspaceStore:
                 min_positive=min_positive,
                 min_negative=min_negative,
                 min_recall=min_recall,
+                reranker_model=str(row["reranker_model"] or "") if row else "",
+                reranker_fingerprint=(
+                    str(row["reranker_fingerprint"] or "") if row else ""
+                ),
             )
         return cursor.rowcount > 0
 
@@ -620,6 +719,8 @@ class WorkspaceStore:
         min_positive: int = 20,
         min_negative: int = 20,
         min_recall: float = 0.90,
+        reranker_model: str = "",
+        reranker_fingerprint: str = "",
     ) -> dict[str, Any]:
         """Fit a transparent raw-logit cutoff from explicit result labels."""
 
@@ -629,11 +730,16 @@ class WorkspaceStore:
             rows = connection.execute(
                 """
                 SELECT judgment, rerank_logit FROM retrieval_feedback
-                WHERE rerank_logit IS NOT NULL
-                """
+                WHERE rerank_logit IS NOT NULL AND reranker_fingerprint = ?
+                """,
+                (reranker_fingerprint,),
             ).fetchall()
             previous = connection.execute(
-                "SELECT enabled FROM quality_calibration WHERE id = 1"
+                """
+                SELECT enabled FROM quality_calibration_v2
+                WHERE reranker_fingerprint = ?
+                """,
+                (reranker_fingerprint,),
             ).fetchone()
         for row in rows:
             score = _optional_finite_float(row["rerank_logit"])
@@ -676,12 +782,14 @@ class WorkspaceStore:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO quality_calibration(
-                    id, threshold, positive_count, negative_count,
+                INSERT INTO quality_calibration_v2(
+                    reranker_fingerprint, reranker_model, threshold,
+                    positive_count, negative_count,
                     positive_recall, specificity, balanced_accuracy,
                     ready, enabled, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(reranker_fingerprint) DO UPDATE SET
+                    reranker_model = excluded.reranker_model,
                     threshold = excluded.threshold,
                     positive_count = excluded.positive_count,
                     negative_count = excluded.negative_count,
@@ -693,6 +801,8 @@ class WorkspaceStore:
                     updated_at = excluded.updated_at
                 """,
                 (
+                    reranker_fingerprint,
+                    reranker_model,
                     threshold,
                     len(positives),
                     len(negatives),
@@ -707,21 +817,39 @@ class WorkspaceStore:
         return self.calibration_status(
             min_positive=min_positive,
             min_negative=min_negative,
+            reranker_model=reranker_model,
+            reranker_fingerprint=reranker_fingerprint,
         )
 
-    def set_calibration_enabled(self, enabled: bool) -> dict[str, Any]:
-        status = self.calibration_status()
+    def set_calibration_enabled(
+        self,
+        enabled: bool,
+        *,
+        reranker_model: str = "",
+        reranker_fingerprint: str = "",
+    ) -> dict[str, Any]:
+        status = self.calibration_status(
+            reranker_model=reranker_model,
+            reranker_fingerprint=reranker_fingerprint,
+        )
+        if not status["updated_at"]:
+            status = self.calibrate_feedback(
+                reranker_model=reranker_model,
+                reranker_fingerprint=reranker_fingerprint,
+            )
         with self.connect() as connection:
             connection.execute(
                 """
-                UPDATE quality_calibration SET enabled = ?, updated_at = ?
-                WHERE id = 1
+                UPDATE quality_calibration_v2 SET enabled = ?, updated_at = ?
+                WHERE reranker_fingerprint = ?
                 """,
-                (1 if enabled else 0, utc_now()),
+                (1 if enabled else 0, utc_now(), reranker_fingerprint),
             )
         return self.calibration_status(
             min_positive=status["minimum_positive"],
             min_negative=status["minimum_negative"],
+            reranker_model=reranker_model,
+            reranker_fingerprint=reranker_fingerprint,
         )
 
     def calibration_status(
@@ -729,10 +857,16 @@ class WorkspaceStore:
         *,
         min_positive: int = 20,
         min_negative: int = 20,
+        reranker_model: str = "",
+        reranker_fingerprint: str = "",
     ) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM quality_calibration WHERE id = 1"
+                """
+                SELECT * FROM quality_calibration_v2
+                WHERE reranker_fingerprint = ?
+                """,
+                (reranker_fingerprint,),
             ).fetchone()
             if row is None:
                 counts = connection.execute(
@@ -741,7 +875,9 @@ class WorkspaceStore:
                         SUM(CASE WHEN judgment = 'relevant' AND rerank_logit IS NOT NULL THEN 1 ELSE 0 END) AS positives,
                         SUM(CASE WHEN judgment != 'relevant' AND rerank_logit IS NOT NULL THEN 1 ELSE 0 END) AS negatives
                     FROM retrieval_feedback
-                    """
+                    WHERE reranker_fingerprint = ?
+                    """,
+                    (reranker_fingerprint,),
                 ).fetchone()
                 positive_count = int(counts["positives"] or 0)
                 negative_count = int(counts["negatives"] or 0)
@@ -757,6 +893,8 @@ class WorkspaceStore:
                     "active": False,
                     "minimum_positive": int(min_positive),
                     "minimum_negative": int(min_negative),
+                    "reranker_model": reranker_model,
+                    "reranker_fingerprint": reranker_fingerprint,
                     "updated_at": "",
                 }
         output = dict(row)
@@ -776,6 +914,8 @@ class WorkspaceStore:
         *,
         min_positive: int = 20,
         min_negative: int = 20,
+        reranker_model: str = "",
+        reranker_fingerprint: str = "",
     ) -> dict[str, Any]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -796,6 +936,8 @@ class WorkspaceStore:
             "calibration": self.calibration_status(
                 min_positive=min_positive,
                 min_negative=min_negative,
+                reranker_model=reranker_model,
+                reranker_fingerprint=reranker_fingerprint,
             ),
         }
 

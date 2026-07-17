@@ -1,8 +1,17 @@
 # Reference Desk
 
+[![Tests](https://github.com/FKENZOLS/reference-desk/actions/workflows/tests.yml/badge.svg)](https://github.com/FKENZOLS/reference-desk/actions/workflows/tests.yml)
+[![Latest release](https://img.shields.io/github/v/release/FKENZOLS/reference-desk)](https://github.com/FKENZOLS/reference-desk/releases/latest)
+![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Reference Desk is a private, local search application for PDF collections. It
 finds relevant passages across all your documents and opens the exact page and
 highlighted source region.
+
+It is an evidence-first alternative to answer-generation tools: the retrieval
+pipeline returns ranked source passages and always preserves a direct route to
+the original PDF evidence.
 
 Your PDFs, indexes, bookmarks, and notes stay on your computer. They are not
 uploaded to GitHub.
@@ -54,9 +63,10 @@ from inside the ZIP.
 ### 3. Double-click `SETUP.bat`
 
 The setup detects NVIDIA CUDA, AMD ROCm, or CPU mode, creates an isolated
-Python environment, installs the correct packages, downloads EmbeddingGemma,
-and checks the computer. The first installation is several gigabytes and can
-take a while.
+Python environment, installs the correct packages, downloads Qwen3-Embedding
+through Ollama, caches the public Qwen tokenizer and reranker from Hugging
+Face, and checks the computer. The first installation is several gigabytes and
+can take a while.
 
 The window stays open if anything goes wrong, so the error message can be
 read. Common solutions are also included in `INSTALL_WINDOWS.txt`.
@@ -128,8 +138,6 @@ GitHub contains only the application. Your PDFs and research data are separate.
 2. Install Reference Desk on the new computer using the instructions above.
 3. Open **Documents** on the new computer and restore the backup.
 
-See [GITHUB_TRANSFER.md](GITHUB_TRANSFER.md) for the shorter transfer checklist.
-
 ## Troubleshooting
 
 ### `python` is not recognized
@@ -153,12 +161,12 @@ Use the full commands shown in this README. They run the scripts with
 `-ExecutionPolicy Bypass` only for that process and do not permanently change
 your Windows policy.
 
-### Ollama is unavailable or EmbeddingGemma is missing
+### Ollama is unavailable or Qwen3-Embedding is missing
 
 Start the Ollama application, then run:
 
 ```powershell
-ollama pull embeddinggemma
+ollama pull qwen3-embedding:0.6b
 ```
 
 ### AMD ROCm setup fails
@@ -217,7 +225,7 @@ flowchart LR
         A["PDF files"] --> B["Docling layout, tables, reading order, and page coordinates"]
         B --> C["Structural parent chunks<br/>up to about 400 tokens"]
         C --> D["Overlapping child passages<br/>about 240 tokens + 40 overlap"]
-        D --> E["EmbeddingGemma vectors<br/>Chroma database"]
+        D --> E["Qwen3-Embedding 0.6B<br/>1024-dimensional Chroma vectors"]
         D --> F["Exact terms and phrases<br/>SQLite FTS5"]
     end
 
@@ -228,7 +236,7 @@ flowchart LR
         F --> H
         G --> I["Reciprocal-rank fusion"]
         H --> I
-        I --> J["BGE cross-encoder<br/>rerank 20 candidates"]
+        I --> J["Qwen3-Reranker 0.6B<br/>yes/no score for 20 candidates"]
         J --> K["Diversity and evidence gate<br/>normally show 5 results"]
     end
 
@@ -256,8 +264,11 @@ the readable passage and exact PDF region.
 
 Each query runs through two independent retrieval lanes:
 
-1. **Dense retrieval** compares the EmbeddingGemma query vector with child
-   vectors in Chroma. It handles paraphrases and related meaning.
+1. **Dense retrieval** sends an instructed search query to
+   `qwen3-embedding:0.6b` through Ollama and compares its 1024-dimensional
+   vector with child vectors in Chroma. Documents are embedded without a task
+   instruction, as recommended for Qwen's asymmetric retrieval format. This
+   lane handles paraphrases and related meaning.
 2. **Lexical retrieval** uses SQLite FTS5 for exact words, phrases, acronyms,
    identifiers, and numbers.
 
@@ -270,16 +281,34 @@ A passage found by both lanes rises naturally, while a strong result from only
 one lane can still survive. By default, each lane retrieves 40 candidates and
 the fused list keeps 20 for reranking.
 
-### Cross-encoder reranking and result diversity
+### Qwen reranking and result diversity
 
-`BAAI/bge-reranker-v2-m3` reads the query and each shortlisted passage together.
-This is more accurate than vector similarity but more expensive, which is why
-it runs only after retrieval has reduced the corpus to 20 candidates.
+`Qwen/Qwen3-Reranker-0.6B` reads the technical-reference instruction, query,
+and each shortlisted passage together. Its causal language model scores the
+next-token alternatives `yes` and `no`; Reference Desk stores their log-odds
+difference and the corresponding probability. This joint judgment is more
+expensive than vector similarity, so it runs only after hybrid retrieval has
+reduced the corpus to 20 candidates. The former BGE classifier remains
+available through environment settings for controlled comparisons.
 
 The final selector normally shows five results. It limits repeated passages
 from the same page or section, then optionally applies a relevance threshold
 learned from explicit user labels. The threshold remains inactive until there
 are enough relevant and incorrect examples to calibrate it safely.
+
+Reranker calibration is keyed to the complete model and prompt fingerprint.
+Changing between Qwen and BGE therefore starts a separate score calibration;
+old thresholds cannot silently affect the new model.
+
+### Model migration and index identity
+
+The Qwen embedding stack uses the new default collection
+`technical_docs_qwen_v1`. Its model digest, 1024 dimensions, query instruction,
+document format, and tokenizer are included in the ingestion fingerprint. If
+any of them changes, Reference Desk refuses to search an incompatible index.
+After upgrading from an EmbeddingGemma release, open **Documents** and choose
+**Reindex all** once. The legacy Chroma collection is not overwritten, which
+makes rollback possible but may temporarily use additional disk space.
 
 ### What the quality metrics mean
 
@@ -307,7 +336,7 @@ counts, fusion, or reranking to be compared against real reference tasks.
 ```powershell
 python main.py serve
 python main.py ingest
-python main.py evaluate benchmark.starter.jsonl
+python main.py evaluate examples/benchmark.example.jsonl
 python main.py doctor
 python main.py export
 python main.py test
@@ -322,6 +351,4 @@ citations, or storage.
 
 ## License
 
-No open-source license has been selected yet. The repository is public for
-viewing and personal installation; public availability alone does not grant
-additional reuse rights.
+Reference Desk is released under the [MIT License](LICENSE).

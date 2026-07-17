@@ -4,7 +4,7 @@ Key changes from the original version:
 - Uses HybridChunker with token-aware splitting and peer merging.
 - Embeds Docling's contextualized chunk text, not only chunk.text.
 - Preserves short titles/section headers by merging them forward.
-- Uses EmbeddingGemma's recommended document/query prefixes.
+- Uses Qwen3-Embedding's asymmetric document/query formatting.
 - Repeats table headers and serializes tables as compact Markdown.
 - Replaces older versions of a source by stable relative source_id.
 - Skips unchanged files and writes debug Markdown/JSONL exports.
@@ -77,13 +77,20 @@ from rag_common import (
 # Configuration
 # ============================================================
 
-# Exact tokenizer for EmbeddingGemma. It can require accepting Google's
-# Hugging Face license. A public multilingual tokenizer is used as fallback.
-PRIMARY_TOKENIZER_MODEL = "google/embeddinggemma-300m"
-FALLBACK_TOKENIZER_MODEL = "intfloat/multilingual-e5-small"
+# Qwen's public tokenizer matches the Ollama embedding model and avoids the
+# gated-model authentication failure of the former EmbeddingGemma tokenizer.
+PRIMARY_TOKENIZER_MODEL = os.environ.get(
+    "RAG_CHUNK_TOKENIZER_MODEL",
+    "Qwen/Qwen3-Embedding-0.6B",
+)
+FALLBACK_TOKENIZER_MODEL = os.environ.get(
+    "RAG_CHUNK_TOKENIZER_FALLBACK",
+    "intfloat/multilingual-e5-small",
+)
+TOKENIZER_USE_AUTH = os.environ.get("RAG_CHUNK_TOKENIZER_USE_AUTH", "0") == "1"
 
-# EmbeddingGemma has a 2048-token input window. Smaller chunks are normally
-# better for precise technical-document retrieval and leave room for headings.
+# Qwen supports a much larger context, but compact chunks remain preferable for
+# precise technical-document retrieval and exact citations.
 MAX_CHUNK_TOKENS = 400
 MIN_CHUNK_TOKENS = 24
 
@@ -133,7 +140,7 @@ SKIP_UNCHANGED_FILES = True
 EXPORT_DEBUG_FILES = True
 
 # Increment whenever chunking, prompts, or metadata change materially.
-INGESTION_VERSION = "docling-hybrid-parent-child-v5"
+INGESTION_VERSION = "docling-hybrid-parent-child-v6-qwen"
 
 
 # ============================================================
@@ -267,7 +274,7 @@ def report_cuda_headroom() -> None:
             f"Only {free_mb} MiB of GPU memory is free; at least "
             f"{CUDA_HEADROOM_WARNING_MB} MiB is required by the ingestion "
             "guard. Stop the search application and run "
-            "`ollama stop embeddinggemma:latest` before retrying."
+            f"`ollama stop {EMBEDDING_MODEL}` before retrying."
         )
         if not ALLOW_LOW_CUDA_HEADROOM:
             raise RuntimeError(message)
@@ -398,7 +405,23 @@ def create_converter(enable_ocr: bool = ENABLE_OCR) -> DocumentConverter:
 
 
 def _load_huggingface_tokenizer(model_name: str) -> HuggingFaceTokenizer:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    errors: list[str] = []
+    token: bool = True if TOKENIZER_USE_AUTH else False
+    tokenizer = None
+    for local_only in (True, False):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                use_fast=True,
+                local_files_only=local_only,
+                token=token,
+            )
+            break
+        except Exception as error:
+            mode = "local cache" if local_only else "public download"
+            errors.append(f"{mode}: {type(error).__name__}: {error}")
+    if tokenizer is None:
+        raise RuntimeError("; ".join(errors))
     return HuggingFaceTokenizer(
         tokenizer=tokenizer,
         max_tokens=MAX_CHUNK_TOKENS,
@@ -1201,7 +1224,7 @@ def convert_page_range_resilient(
     if page_start >= page_end:
         recovery = (
             " Stop the search application, run "
-            "`ollama stop embeddinggemma:latest`, and retry ingestion."
+            f"`ollama stop {EMBEDDING_MODEL}`, and retry ingestion."
             if gpu_oom
             else ""
         )

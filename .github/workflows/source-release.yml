@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to receive the Windows ZIP"
+        description: "Release tag to create or update with the Windows ZIP"
         required: false
         type: string
 
@@ -46,10 +46,8 @@ jobs:
         run: |
           $tag = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { $env:GITHUB_REF_NAME }
           $archive = "release/reference-desk-windows.zip"
-          gh release view $tag --json tagName *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $archive --clobber
-          } else {
-            gh release create $tag $archive --title "Reference Desk $tag" --generate-notes
+          gh release upload $tag $archive --clobber --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag $archive --title "Reference Desk $tag" --generate-notes --repo $env:GITHUB_REPOSITORY
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -11,9 +11,9 @@ The project is a local evidence-retrieval application:
 PDFs
   -> Docling conversion and provenance
   -> parent/child chunk preparation
-  -> EmbeddingGemma vectors + SQLite FTS5
+  -> Qwen3-Embedding vectors + SQLite FTS5
   -> reciprocal-rank fusion
-  -> BGE cross-encoder reranking
+  -> Qwen3-Reranker yes/no scoring
   -> results, feedback, citations, PDF viewer, and research workspace
 ```
 
@@ -83,6 +83,11 @@ workspace matters.
     `torch.version.hip`, never a different device string.
 15. Hardware-specific PyTorch wheels must be installed before the portable
     dependency layer, and local hardware profiles must never be committed.
+16. Embedding dimensions, prompts, model revisions, and collection names are
+    part of the index identity. Qwen's 1024-dimensional vectors must never be
+    inserted into a legacy 768-dimensional collection.
+17. Relevance calibration is reranker-specific. Scores from BGE and Qwen must
+    never be fitted into the same threshold.
 
 ## Application lifecycle
 

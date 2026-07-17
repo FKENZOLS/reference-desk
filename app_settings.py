@@ -7,6 +7,8 @@ owns only search, reranking, and web-server configuration so that
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 
 
@@ -30,10 +32,23 @@ RERANK_CANDIDATES = env_int("RAG_RERANK_CANDIDATES", 20)
 RRF_K = env_int("RAG_RRF_K", 60)
 RERANK_WEIGHT = env_float("RAG_RERANK_WEIGHT", 0.60)
 
-# Cross-encoder reranking
+# Local reranking. ``auto`` selects Qwen's generative yes/no scorer for
+# Qwen3-Reranker models and the former sequence-classifier path for BGE.
 RERANKER_MODEL = os.environ.get(
     "RAG_RERANKER_MODEL",
-    "BAAI/bge-reranker-v2-m3",
+    "Qwen/Qwen3-Reranker-0.6B",
+)
+RERANKER_REVISION = os.environ.get("RAG_RERANKER_REVISION", "main")
+RERANKER_BACKEND = os.environ.get("RAG_RERANKER_BACKEND", "auto")
+RERANKER_USE_AUTH = env_flag("RAG_RERANKER_USE_AUTH", False)
+RERANKER_PROMPT_VERSION = "qwen3-reranker-reference-v1"
+RERANK_INSTRUCTION = os.environ.get(
+    "RAG_RERANK_INSTRUCTION",
+    (
+        "Given a technical-document search query, determine whether the "
+        "document passage directly defines, specifies, explains, or constrains "
+        "the requested subject. Prefer exact, citable reference evidence."
+    ),
 )
 RERANK_MAX_LENGTH = env_int("RAG_RERANK_MAX_LENGTH", 512)
 RERANK_BATCH_SIZE = env_int("RAG_RERANK_BATCH_SIZE", 8)
@@ -43,6 +58,49 @@ MAX_RESULTS_PER_SECTION = env_int("RAG_MAX_RESULTS_PER_SECTION", 2)
 MAX_RESULTS_PER_PAGE = env_int("RAG_MAX_RESULTS_PER_PAGE", 1)
 MAX_RESULT_TEXT_SIMILARITY = env_float("RAG_MAX_RESULT_TEXT_SIMILARITY", 0.88)
 RERANK_USE_FP16 = env_flag("RAG_RERANK_FP16", True)
+
+
+def resolve_reranker_backend(
+    model_name: str = RERANKER_MODEL,
+    configured: str = RERANKER_BACKEND,
+) -> str:
+    value = configured.strip().lower().replace("_", "-")
+    if value in {"", "auto"}:
+        return "qwen-causal-lm" if "qwen3-reranker" in model_name.lower() else "classifier"
+    aliases = {
+        "qwen": "qwen-causal-lm",
+        "qwen-causal": "qwen-causal-lm",
+        "qwen-causal-lm": "qwen-causal-lm",
+        "classifier": "classifier",
+        "cross-encoder": "classifier",
+        "bge": "classifier",
+    }
+    try:
+        return aliases[value]
+    except KeyError as error:
+        raise ValueError(
+            "RAG_RERANKER_BACKEND must be auto, qwen-causal-lm, or classifier."
+        ) from error
+
+
+def reranker_configuration() -> dict[str, object]:
+    return {
+        "model": RERANKER_MODEL,
+        "revision": RERANKER_REVISION,
+        "backend": resolve_reranker_backend(),
+        "max_length": RERANK_MAX_LENGTH,
+        "prompt_version": RERANKER_PROMPT_VERSION,
+        "instruction": RERANK_INSTRUCTION,
+    }
+
+
+def reranker_fingerprint() -> str:
+    payload = json.dumps(
+        reranker_configuration(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 # Raw-logit relevance gate; disabled until calibrated on a labeled benchmark.
 MIN_BEST_RERANK_LOGIT = env_float("RAG_MIN_BEST_RERANK_LOGIT", -2.2)
