@@ -481,10 +481,23 @@ _DOCUMENT_JOB: dict[str, Any] = {
     "search_available": False,
     "concurrency_reason": "No indexing job is running.",
 }
+_INDEX_COMMIT_BARRIER_LOCK = threading.Lock()
+_INDEX_COMMIT_BARRIER: _IndexCommitBarrier | None = None
+_INDEX_COMMIT_GATE_PATH: Path | None = None
 
 
 class DocumentMaintenanceError(RuntimeError):
     """Raised when a search is attempted during an index update."""
+
+
+@dataclass
+class _IndexCommitBarrier:
+    """One app-approved interval during which a child may update both indexes."""
+
+    token: str
+    source_id: str
+    gate_path: Path
+    finished: threading.Event = field(default_factory=threading.Event)
 
 
 def _gpu_memory_mib() -> tuple[int, int] | None:
@@ -598,6 +611,86 @@ def _append_document_job_log(line: str) -> None:
             _DOCUMENT_JOB["message"] = cleaned
 
 
+def _write_index_commit_permission(gate_path: Path, token: str) -> None:
+    """Atomically acknowledge one child request after active searches finish."""
+
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = gate_path.with_suffix(gate_path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"token": token}), encoding="utf-8")
+    os.replace(temporary, gate_path)
+
+
+def _run_index_commit_barrier(barrier: _IndexCommitBarrier) -> None:
+    """Block new searches, wait for an active one, then release the child."""
+
+    global _INDEX_COMMIT_BARRIER
+    _DOCUMENT_MAINTENANCE.set()
+    _update_document_job(
+        message=f"Applying indexed changes for {barrier.source_id}. Search is paused briefly."
+    )
+    try:
+        with _SEARCH_MAINTENANCE_LOCK:
+            if barrier.finished.is_set():
+                return
+            _write_index_commit_permission(barrier.gate_path, barrier.token)
+            barrier.finished.wait()
+    finally:
+        with _INDEX_COMMIT_BARRIER_LOCK:
+            is_active = _INDEX_COMMIT_BARRIER is barrier
+            if is_active:
+                _INDEX_COMMIT_BARRIER = None
+        if is_active:
+            _DOCUMENT_MAINTENANCE.clear()
+
+
+def _begin_index_commit(source_id: str, token: str) -> None:
+    """Start the short, synchronized search pause requested by ingestion."""
+
+    global _INDEX_COMMIT_BARRIER
+    with _INDEX_COMMIT_BARRIER_LOCK:
+        gate_path = _INDEX_COMMIT_GATE_PATH
+        previous = _INDEX_COMMIT_BARRIER
+        if gate_path is None:
+            _append_document_job_log(
+                "Ignored an index commit request without an active commit gate."
+            )
+            return
+        if previous is not None and not previous.finished.is_set():
+            raise RuntimeError("A second index commit was requested before the first ended.")
+        barrier = _IndexCommitBarrier(
+            token=token,
+            source_id=source_id or "document index",
+            gate_path=gate_path,
+        )
+        _INDEX_COMMIT_BARRIER = barrier
+    threading.Thread(
+        target=_run_index_commit_barrier,
+        args=(barrier,),
+        name="index-commit-barrier",
+        daemon=True,
+    ).start()
+
+
+def _finish_index_commit(token: str) -> None:
+    """Release a child after it finishes or rolls back its index update."""
+
+    with _INDEX_COMMIT_BARRIER_LOCK:
+        barrier = _INDEX_COMMIT_BARRIER
+        if barrier is None or barrier.token != token:
+            _append_document_job_log("Ignored an unmatched index commit completion event.")
+            return
+        barrier.finished.set()
+
+
+def _release_index_commit_barrier() -> None:
+    """Ensure a crashed child never leaves the local app unable to search."""
+
+    with _INDEX_COMMIT_BARRIER_LOCK:
+        barrier = _INDEX_COMMIT_BARRIER
+        if barrier is not None:
+            barrier.finished.set()
+
+
 def _handle_corpus_event(line: str) -> bool:
     marker = "CORPUS_EVENT "
     stripped = line.strip()
@@ -612,6 +705,18 @@ def _handle_corpus_event(line: str) -> bool:
     if kind == "started" and source_id:
         CORPUS_SCALE.mark_event(source_id, "processing")
         _update_document_job(message=f"Processing {source_id}")
+    elif kind == "commit_requested":
+        token = str(event.get("token") or "")
+        if token:
+            _begin_index_commit(source_id, token)
+        else:
+            _append_document_job_log("Ignored an index commit request without a token.")
+    elif kind == "commit_finished":
+        token = str(event.get("token") or "")
+        if token:
+            _finish_index_commit(token)
+        else:
+            _append_document_job_log("Ignored an index commit completion without a token.")
     elif kind == "completed" and source_id:
         CORPUS_SCALE.mark_event(source_id, "complete")
         if hasattr(DOCUMENT_REPOSITORY, "clear_pending_sources"):
@@ -743,6 +848,7 @@ def _run_document_index_job(
     force: bool,
     search_available: bool = False,
 ) -> None:
+    global _INDEX_COMMIT_GATE_PATH
     _update_document_job(
         state="waiting",
         message=(
@@ -752,6 +858,7 @@ def _run_document_index_job(
         ),
     )
     exit_code = -1
+    commit_gate: Path | None = None
     try:
         if search_available:
             _update_document_job(
@@ -789,6 +896,13 @@ def _run_document_index_job(
             environment["RAG_GPU_HEADROOM_WARNING_MB"] = str(
                 DOCLING_GPU_HEADROOM_MB + CONCURRENT_QUERY_RESERVE_MB
             )
+            commit_gate = DB_DIR / f".index-commit-{token_urlsafe(8)}.json"
+            commit_gate.unlink(missing_ok=True)
+            with _INDEX_COMMIT_BARRIER_LOCK:
+                _INDEX_COMMIT_GATE_PATH = commit_gate
+            command.extend(("--commit-gate", str(commit_gate)))
+            if managed_queue:
+                prune_command.extend(("--commit-gate", str(commit_gate)))
         _update_document_job(
             state="running",
             message=(
@@ -864,7 +978,12 @@ def _run_document_index_job(
                 message=(
                     f"Index updated. {quarantined} failed document(s) were moved to quarantine."
                     if quarantined
-                    else "The document index is current. Search models will reload on the next query."
+                    else (
+                        "The document index is current. Search stayed available "
+                        "except during brief index commits."
+                        if search_available
+                        else "The document index is current. Search models will reload on the next query."
+                    )
                 ),
                 finished_at=datetime.now(tz=UTC).isoformat(),
             )
@@ -900,6 +1019,12 @@ def _run_document_index_job(
             finished_at=datetime.now(tz=UTC).isoformat(),
         )
     finally:
+        _release_index_commit_barrier()
+        if commit_gate is not None:
+            commit_gate.unlink(missing_ok=True)
+        with _INDEX_COMMIT_BARRIER_LOCK:
+            if _INDEX_COMMIT_GATE_PATH == commit_gate:
+                _INDEX_COMMIT_GATE_PATH = None
         _DOCUMENT_MAINTENANCE.clear()
 
 
@@ -1688,6 +1813,10 @@ def source_citation(
 def get_citation_collection() -> Any:
     """Open Chroma without loading the embedding or reranker models."""
 
+    if _DOCUMENT_MAINTENANCE.is_set():
+        raise DocumentMaintenanceError(
+            "The document index is applying a revision. Reload this citation shortly."
+        )
     global _CITATION_COLLECTION
     if _RUNTIME is not None:
         return _RUNTIME.collection
@@ -1713,6 +1842,8 @@ def load_citation_record(
             ids=[chunk_id],
             include=["documents", "metadatas"],
         )
+    except DocumentMaintenanceError:
+        raise
     except Exception as error:
         LOGGER.warning("Could not load citation chunk %s: %s", chunk_id, error)
         return None
@@ -4301,13 +4432,16 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             source_path = resolve_source_path(source_id)
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail="PDF source not found") from error
-        citation_data = build_citation_view_data(
-            source_path,
-            source_id,
-            page,
-            q,
-            chunk,
-        )
+        try:
+            citation_data = build_citation_view_data(
+                source_path,
+                source_id,
+                page,
+                q,
+                chunk,
+            )
+        except DocumentMaintenanceError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         citation_data.update(
             resolve_source_navigation(nav, at, source_id, chunk)
         )

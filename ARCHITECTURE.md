@@ -72,6 +72,8 @@ workspace matters.
 6. Search and ingestion may share a GPU only when live free VRAM covers the
    Docling headroom plus a query reserve. Otherwise ingestion releases search
    models and runs exclusively; total VRAM alone is not the deciding factor.
+   When concurrent, an app-controlled commit gate pauses search while Chroma,
+   SQLite FTS, and the manifest switch one source revision together.
 7. Citation metadata must retain page and bounding-box provenance when Docling
    provides it.
 8. Workspace data is independent from ingestion and must survive index rebuilds.
@@ -106,16 +108,17 @@ workspace matters.
 ### Managed ingestion
 
 1. Stage document changes in `DocumentRepository` and create persistent queue items.
-2. Block new searches and wait for the current search lock.
-3. Measure free VRAM. Keep the loaded search runtime only when the combined
+2. Measure free VRAM. Keep the loaded search runtime only when the combined
    Docling and query reserve fits; otherwise release the reranker and retained
    Ollama embedding model.
-4. Run the selected sources through `ingest.py --queue-managed --prune`.
-5. Commit each successful source immediately; quarantine a failed source and continue.
-6. Honor pause requests before beginning the next document.
-7. Prune deleted and quarantined sources, then reload search resources lazily.
-   Concurrent searches may see the previous or newly committed source state
-   while a document is being processed.
+3. Run the selected sources through `ingest.py --queue-managed --prune`.
+4. Keep search available during conversion, chunking, and embedding when the
+   GPU reserve permits it.
+5. Before each source replacement or prune, pause new searches, wait for the
+   active query lock, then commit Chroma, FTS, and manifest changes together.
+6. Quarantine a failed source and continue; a failed commit releases the search
+   pause without exposing a partially updated source.
+7. Honor pause requests before beginning the next document.
 
 ## Where to make common changes
 

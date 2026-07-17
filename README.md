@@ -189,6 +189,9 @@ loaded. It keeps search available only when that free memory covers Docling's
 configured headroom plus a small live-query reserve. It does not rely on a
 fixed VRAM size. Set `RAG_SEARCH_DURING_INGESTION=always` only if you want to
 override that safety calculation; `never` restores strictly exclusive indexing.
+When concurrent mode is active, search pauses only briefly while a document's
+Chroma records, lexical index, and manifest are committed, so a result never
+mixes old and new revisions of the same source.
 
 ### Check the installation
 

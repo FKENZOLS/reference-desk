@@ -21,9 +21,12 @@ import hashlib
 import json
 import os
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from secrets import token_urlsafe
 from typing import Any, Iterable, Sequence
 
 import chromadb
@@ -138,6 +141,7 @@ TABLE_MODE = TableFormerMode.ACCURATE
 BATCH_SIZE = 64
 SKIP_UNCHANGED_FILES = True
 EXPORT_DEBUG_FILES = True
+INDEX_COMMIT_WAIT_SECONDS = 120
 
 # Increment whenever chunking, prompts, or metadata change materially.
 INGESTION_VERSION = "docling-hybrid-parent-child-v6-qwen"
@@ -1271,6 +1275,7 @@ def process_pdf(
     ocr_enabled: bool = False,
     auto_ocr: bool = AUTO_OCR,
     ocr_converter: DocumentConverter | None = None,
+    commit_gate: Path | None = None,
 ) -> ProcessResult:
     source_id = pdf_path.resolve().relative_to(PDF_DIR.resolve()).as_posix()
     file_hash = calculate_file_hash(pdf_path)
@@ -1396,38 +1401,40 @@ def process_pdf(
         print("  No usable chunks were produced.")
         return ProcessResult(status="no_output")
 
-    # Complete every model call before touching the active index. If a Chroma
-    # batch write then fails, newly introduced IDs are rolled back.
+    # Complete every model call before touching the active index. In concurrent
+    # mode, the app pauses search only for this short commit window so dense and
+    # lexical retrieval never observe different source revisions.
     vectors = embed_documents_in_batches(documents, embeddings)
-    upsert_documents_in_batches(
-        collection=collection,
-        documents=documents,
-        ids=ids,
-        vectors=vectors,
-        existing_ids=existing_ids,
-    )
+    with index_commit_window(commit_gate, source_id):
+        upsert_documents_in_batches(
+            collection=collection,
+            documents=documents,
+            ids=ids,
+            vectors=vectors,
+            existing_ids=existing_ids,
+        )
 
-    new_id_set = set(ids)
-    old_ids = [chunk_id for chunk_id in existing_ids if chunk_id not in new_id_set]
-    if old_ids:
-        collection.delete(ids=old_ids)
+        new_id_set = set(ids)
+        old_ids = [chunk_id for chunk_id in existing_ids if chunk_id not in new_id_set]
+        if old_ids:
+            collection.delete(ids=old_ids)
 
-    replace_lexical_source(
-        path=LEXICAL_DB_PATH,
-        source_id=source_id,
-        documents=documents,
-        ids=ids,
-    )
+        replace_lexical_source(
+            path=LEXICAL_DB_PATH,
+            source_id=source_id,
+            documents=documents,
+            ids=ids,
+        )
 
-    manifest["sources"][source_id] = {
-        "complete": True,
-        "file_hash": file_hash,
-        "ingestion_fingerprint": current_fingerprint,
-        "embedding_fingerprint": embedding_fingerprint(),
-        "chunk_count": len(ids),
-        "ids_fingerprint": ids_fingerprint(ids),
-    }
-    save_manifest(manifest)
+        manifest["sources"][source_id] = {
+            "complete": True,
+            "file_hash": file_hash,
+            "ingestion_fingerprint": current_fingerprint,
+            "embedding_fingerprint": embedding_fingerprint(),
+            "chunk_count": len(ids),
+            "ids_fingerprint": ids_fingerprint(ids),
+        }
+        save_manifest(manifest)
 
     try:
         export_debug_files(source_id, markdown, documents)
@@ -1558,12 +1565,65 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Persistent queue state checked between documents for pause requests.",
     )
+    parser.add_argument(
+        "--commit-gate",
+        type=Path,
+        help=(
+            "Optional app-controlled gate that pauses search only while an "
+            "index revision is committed."
+        ),
+    )
     return parser.parse_args()
 
 
 def emit_corpus_event(event: str, **values: Any) -> None:
     payload = {"event": event, **values}
     print("CORPUS_EVENT " + json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def _commit_gate_is_open(path: Path, token: str) -> bool:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and value.get("token") == token
+
+
+@contextmanager
+def index_commit_window(gate_path: Path | None, source_id: str) -> Iterable[None]:
+    """Wait for the app to pause searches around one atomic source update."""
+
+    token = ""
+    if gate_path is not None:
+        token = token_urlsafe(16)
+        emit_corpus_event("commit_requested", source_id=source_id, token=token)
+        deadline = time.monotonic() + INDEX_COMMIT_WAIT_SECONDS
+        while not _commit_gate_is_open(gate_path, token):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Timed out waiting for the application to pause searches "
+                    "before committing the index."
+                )
+            time.sleep(0.05)
+    try:
+        yield
+    except Exception:
+        if token:
+            emit_corpus_event(
+                "commit_finished",
+                source_id=source_id,
+                token=token,
+                status="failed",
+            )
+        raise
+    else:
+        if token:
+            emit_corpus_event(
+                "commit_finished",
+                source_id=source_id,
+                token=token,
+                status="complete",
+            )
 
 
 def queue_pause_requested(control_path: Path | None) -> bool:
@@ -1633,12 +1693,13 @@ def main() -> None:
             path.resolve().relative_to(PDF_DIR.resolve()).as_posix()
             for path in sorted(PDF_DIR.rglob("*.pdf"))
         }
-        pruned_documents = prune_removed_sources(
-            collection=collection,
-            manifest=manifest,
-            active_source_ids=active_source_ids,
-        )
-        synchronize_lexical_index(collection)
+        with index_commit_window(args.commit_gate, "__corpus_prune__"):
+            pruned_documents = prune_removed_sources(
+                collection=collection,
+                manifest=manifest,
+                active_source_ids=active_source_ids,
+            )
+            synchronize_lexical_index(collection)
         print(f"Pruned documents: {pruned_documents}")
         return
 
@@ -1675,6 +1736,7 @@ def main() -> None:
                 ocr_enabled=ocr_enabled,
                 auto_ocr=auto_ocr,
                 ocr_converter=ocr_converter,
+                commit_gate=args.commit_gate,
             )
 
             if result.status == "unchanged":
@@ -1712,18 +1774,19 @@ def main() -> None:
             )
 
     pruned_documents = 0
-    if args.prune and not paused:
-        active_source_ids = {
-            path.resolve().relative_to(PDF_DIR.resolve()).as_posix()
-            for path in sorted(PDF_DIR.rglob("*.pdf"))
-        }
-        pruned_documents = prune_removed_sources(
-            collection=collection,
-            manifest=manifest,
-            active_source_ids=active_source_ids,
-        )
+    with index_commit_window(args.commit_gate, "__corpus_prune__"):
+        if args.prune and not paused:
+            active_source_ids = {
+                path.resolve().relative_to(PDF_DIR.resolve()).as_posix()
+                for path in sorted(PDF_DIR.rglob("*.pdf"))
+            }
+            pruned_documents = prune_removed_sources(
+                collection=collection,
+                manifest=manifest,
+                active_source_ids=active_source_ids,
+            )
 
-    synchronize_lexical_index(collection)
+        synchronize_lexical_index(collection)
 
     print("\n" + "=" * 70)
     print("Ingestion complete")

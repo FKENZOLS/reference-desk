@@ -1,7 +1,12 @@
+import json
+import threading
+import time
+
 from ingest import (
     ChunkRecord,
     convert_page_range_resilient,
     ids_fingerprint,
+    index_commit_window,
     is_cuda_out_of_memory,
     merge_short_chunks,
     report_cuda_headroom,
@@ -158,3 +163,36 @@ def test_low_cuda_headroom_stops_before_conversion(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match=r"ollama stop qwen3-embedding:0\.6b"):
         report_cuda_headroom()
+
+
+def test_index_commit_window_waits_for_the_app_permission(tmp_path, monkeypatch) -> None:
+    gate = tmp_path / "commit-gate.json"
+    events = []
+    entered = threading.Event()
+    monkeypatch.setattr("ingest.token_urlsafe", lambda _: "commit-token")
+    monkeypatch.setattr(
+        "ingest.emit_corpus_event",
+        lambda event, **values: events.append((event, values)),
+    )
+
+    def commit() -> None:
+        with index_commit_window(gate, "manual.pdf"):
+            entered.set()
+
+    worker = threading.Thread(target=commit)
+    worker.start()
+    deadline = time.monotonic() + 1
+    while not events and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert events == [("commit_requested", {"source_id": "manual.pdf", "token": "commit-token"})]
+    assert not entered.is_set()
+
+    gate.write_text(json.dumps({"token": "commit-token"}), encoding="utf-8")
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert entered.is_set()
+    assert events[-1] == (
+        "commit_finished",
+        {"source_id": "manual.pdf", "token": "commit-token", "status": "complete"},
+    )

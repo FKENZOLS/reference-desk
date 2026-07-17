@@ -2,6 +2,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -216,6 +217,8 @@ def test_search_is_paused_during_document_maintenance() -> None:
     try:
         with pytest.raises(search_app.DocumentMaintenanceError):
             search_app.search_with_additional("test query")
+        with pytest.raises(search_app.DocumentMaintenanceError):
+            search_app.get_citation_collection()
     finally:
         search_app._DOCUMENT_MAINTENANCE.clear()
 
@@ -252,6 +255,35 @@ def test_concurrent_indexing_allows_a_query_when_headroom_remains(monkeypatch) -
     monkeypatch.setattr(search_app, "_gpu_memory_mib", lambda: (767, 6144))
     with pytest.raises(search_app.DocumentMaintenanceError, match="767 MiB"):
         search_app._guard_search_during_ingestion()
+
+
+def test_index_commit_pauses_search_until_the_child_finishes(tmp_path, monkeypatch) -> None:
+    gate = tmp_path / "commit-gate.json"
+    monkeypatch.setattr(search_app, "_INDEX_COMMIT_GATE_PATH", gate)
+    monkeypatch.setattr(search_app, "_INDEX_COMMIT_BARRIER", None)
+    search_app._DOCUMENT_MAINTENANCE.clear()
+
+    assert search_app._handle_corpus_event(
+        'CORPUS_EVENT {"event":"commit_requested","source_id":"manual.pdf","token":"abc"}\n'
+    )
+    deadline = time.monotonic() + 1
+    while (not gate.is_file() or not search_app._DOCUMENT_MAINTENANCE.is_set()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert search_app._DOCUMENT_MAINTENANCE.is_set()
+    assert json.loads(gate.read_text(encoding="utf-8")) == {"token": "abc"}
+    assert not search_app._SEARCH_MAINTENANCE_LOCK.acquire(blocking=False)
+
+    assert search_app._handle_corpus_event(
+        'CORPUS_EVENT {"event":"commit_finished","source_id":"manual.pdf","token":"abc"}\n'
+    )
+    deadline = time.monotonic() + 1
+    while search_app._DOCUMENT_MAINTENANCE.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert not search_app._DOCUMENT_MAINTENANCE.is_set()
+    assert search_app._SEARCH_MAINTENANCE_LOCK.acquire(blocking=False)
+    search_app._SEARCH_MAINTENANCE_LOCK.release()
 
 
 def test_successful_background_job_clears_pending_changes(monkeypatch) -> None:
