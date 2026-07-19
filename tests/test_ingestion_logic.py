@@ -5,6 +5,7 @@ import time
 from ingest import (
     ChunkRecord,
     convert_page_range_resilient,
+    docling_safe_pdf_path,
     ids_fingerprint,
     index_commit_window,
     is_cuda_out_of_memory,
@@ -132,6 +133,57 @@ def test_failed_page_window_is_split_until_it_succeeds(tmp_path) -> None:
     )
     pages = sorted(page for result in results for page in result.document.pages)
     assert pages == [1, 2, 3, 4, 5]
+
+
+def test_unicode_pdf_name_is_staged_as_temporary_ascii_path(tmp_path) -> None:
+    original_path = tmp_path / "Anna’s Archive.pdf"
+    original_path.write_bytes(b"example-pdf-bytes")
+
+    with docling_safe_pdf_path(original_path) as safe_path:
+        assert safe_path != original_path.resolve()
+        assert str(safe_path).isascii()
+        assert safe_path.suffix == ".pdf"
+        assert safe_path.read_bytes() == original_path.read_bytes()
+        staged_path = safe_path
+
+    assert original_path.exists()
+    assert not staged_path.exists()
+
+
+def test_pdfium_converter_is_used_after_default_parser_failure(tmp_path) -> None:
+    class FailingConverter:
+        def convert(self, path, page_range, raises_on_error):
+            return SimpleNamespace(
+                document=SimpleNamespace(pages={}),
+                errors=[SimpleNamespace(error_message="backend could not parse")],
+            )
+
+    class FallbackConverter:
+        def __init__(self):
+            self.calls = 0
+
+        def convert(self, path, page_range, raises_on_error):
+            self.calls += 1
+            start, end = page_range
+            return SimpleNamespace(
+                document=SimpleNamespace(
+                    pages={page: object() for page in range(start, end + 1)}
+                ),
+                errors=[],
+            )
+
+    fallback = FallbackConverter()
+    results = convert_page_range_resilient(
+        FailingConverter(),
+        tmp_path / "manual.pdf",
+        1,
+        3,
+        fallback_converter=fallback,
+        source_name="original’s title.pdf",
+    )
+
+    assert fallback.calls == 1
+    assert sorted(results[0].document.pages) == [1, 2, 3]
 
 
 def test_cuda_oom_is_recognized_and_reports_recovery(tmp_path) -> None:

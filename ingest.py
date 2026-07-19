@@ -21,7 +21,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -33,6 +36,7 @@ import chromadb
 import pypdfium2 as pdfium
 import torch
 from docling.chunking import HybridChunker
+from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -382,7 +386,10 @@ class ChunkingRuntime:
         return clean_text(getattr(chunk, "text", "") or "")
 
 
-def create_converter(enable_ocr: bool = ENABLE_OCR) -> DocumentConverter:
+def create_converter(
+    enable_ocr: bool = ENABLE_OCR,
+    pdf_backend: type[Any] | None = None,
+) -> DocumentConverter:
     settings.perf.page_batch_size = DOCLING_PAGE_BATCH_SIZE
     settings.perf.page_batch_concurrency = 1
     pipeline_options = PdfPipelineOptions()
@@ -399,13 +406,57 @@ def create_converter(enable_ocr: bool = ENABLE_OCR) -> DocumentConverter:
         pipeline_options.table_structure_options.mode = TABLE_MODE
         pipeline_options.table_structure_options.do_cell_matching = True
 
+    format_option_kwargs: dict[str, Any] = {
+        "pipeline_options": pipeline_options,
+    }
+    if pdf_backend is not None:
+        format_option_kwargs["backend"] = pdf_backend
+
     return DocumentConverter(
         format_options={
-            InputFormat.PDF: PdfFormatOption(
-                pipeline_options=pipeline_options,
-            )
+            InputFormat.PDF: PdfFormatOption(**format_option_kwargs)
         }
     )
+
+
+def _ascii_pdf_name(pdf_path: Path) -> str:
+    normalized = unicodedata.normalize("NFKD", pdf_path.stem)
+    ascii_stem = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_stem)
+    ascii_stem = re.sub(r"_+", "_", ascii_stem).strip(" ._")
+    ascii_stem = ascii_stem[:80].rstrip(" ._") or "document"
+    name_hash = hashlib.sha256(pdf_path.name.encode("utf-8")).hexdigest()[:10]
+    return f"{ascii_stem}-{name_hash}.pdf"
+
+
+@contextmanager
+def docling_safe_pdf_path(pdf_path: Path) -> Iterable[Path]:
+    """Yield a short ASCII path for parsers that mishandle Windows Unicode paths."""
+
+    resolved_path = pdf_path.resolve()
+    if str(resolved_path).isascii() and len(str(resolved_path)) < 240:
+        yield resolved_path
+        return
+
+    preferred_root = Path(tempfile.gettempdir())
+    if not str(preferred_root.resolve()).isascii():
+        preferred_root = Path(__file__).resolve().parent
+    if not str(preferred_root.resolve()).isascii():
+        raise RuntimeError(
+            "Docling needs an ASCII temporary directory to open this PDF path."
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="reference-desk-docling-",
+        dir=preferred_root,
+    ) as temporary_directory:
+        safe_path = Path(temporary_directory) / _ascii_pdf_name(resolved_path)
+        try:
+            os.link(resolved_path, safe_path)
+        except OSError:
+            shutil.copy2(resolved_path, safe_path)
+        print(f"  Using temporary Docling-safe filename: {safe_path.name}")
+        yield safe_path
 
 
 def _load_huggingface_tokenizer(model_name: str) -> HuggingFaceTokenizer:
@@ -1204,6 +1255,9 @@ def convert_page_range_resilient(
     pdf_path: Path,
     page_start: int,
     page_end: int,
+    *,
+    fallback_converter: DocumentConverter | None = None,
+    source_name: str | None = None,
 ) -> list[Any]:
     """Convert a range, recursively splitting it after native/page failures."""
 
@@ -1221,6 +1275,30 @@ def convert_page_range_resilient(
         problem = f"{type(error).__name__}: {error}"
 
     gpu_oom = is_gpu_out_of_memory(problem)
+    if not gpu_oom and fallback_converter is not None:
+        print("  Default PDF parser failed; retrying with PDFium backend.")
+        try:
+            fallback_result = fallback_converter.convert(
+                pdf_path,
+                page_range=(page_start, page_end),
+                raises_on_error=False,
+            )
+            fallback_problem = conversion_problem(
+                fallback_result,
+                page_start,
+                page_end,
+            )
+            if fallback_problem is None:
+                return [fallback_result]
+        except Exception as error:
+            fallback_result = None
+            fallback_problem = f"{type(error).__name__}: {error}"
+        converter = fallback_converter
+        fallback_converter = None
+        result = fallback_result
+        problem = f"PDFium fallback: {fallback_problem}"
+        gpu_oom = is_gpu_out_of_memory(problem)
+
     if gpu_oom:
         print("  GPU memory exhaustion detected; clearing cache before retry.")
         release_cuda_memory()
@@ -1233,7 +1311,8 @@ def convert_page_range_resilient(
             else ""
         )
         raise RuntimeError(
-            f"Docling could not convert page {page_start} of {pdf_path.name}: "
+            f"Docling could not convert page {page_start} of "
+            f"{source_name or pdf_path.name}: "
             f"{problem}.{recovery}"
         )
 
@@ -1249,11 +1328,15 @@ def convert_page_range_resilient(
         pdf_path,
         page_start,
         midpoint,
+        fallback_converter=fallback_converter,
+        source_name=source_name,
     ) + convert_page_range_resilient(
         converter,
         pdf_path,
         midpoint + 1,
         page_end,
+        fallback_converter=fallback_converter,
+        source_name=source_name,
     )
 
 
@@ -1275,6 +1358,9 @@ def process_pdf(
     ocr_enabled: bool = False,
     auto_ocr: bool = AUTO_OCR,
     ocr_converter: DocumentConverter | None = None,
+    fallback_converter: DocumentConverter | None = None,
+    ocr_fallback_converter: DocumentConverter | None = None,
+    docling_pdf_path: Path | None = None,
     commit_gate: Path | None = None,
 ) -> ProcessResult:
     source_id = pdf_path.resolve().relative_to(PDF_DIR.resolve()).as_posix()
@@ -1306,7 +1392,8 @@ def process_pdf(
         print(f"  Unchanged; keeping {len(existing_ids)} existing chunks.")
         return ProcessResult(status="unchanged")
 
-    page_count = get_pdf_page_count(pdf_path)
+    conversion_path = docling_pdf_path or pdf_path
+    page_count = get_pdf_page_count(conversion_path)
     if page_count <= 0:
         print("  PDF contains no pages.")
         return ProcessResult(status="no_output")
@@ -1319,9 +1406,11 @@ def process_pdf(
         print(f"  Converting pages {page_start}-{page_end} of {page_count}")
         base_results = convert_page_range_resilient(
             converter,
-            pdf_path,
+            conversion_path,
             page_start,
             page_end,
+            fallback_converter=fallback_converter,
+            source_name=pdf_path.name,
         )
 
         while base_results:
@@ -1349,9 +1438,11 @@ def process_pdf(
                     (result, True)
                     for result in convert_page_range_resilient(
                         ocr_converter,
-                        pdf_path,
+                        conversion_path,
                         retry_start,
                         retry_end,
+                        fallback_converter=ocr_fallback_converter,
+                        source_name=pdf_path.name,
                     )
                 ]
                 base_result = None
@@ -1704,7 +1795,16 @@ def main() -> None:
         return
 
     converter = create_converter(enable_ocr=ocr_enabled)
+    fallback_converter = create_converter(
+        enable_ocr=ocr_enabled,
+        pdf_backend=PyPdfiumDocumentBackend,
+    )
     ocr_converter = create_converter(enable_ocr=True) if auto_ocr else None
+    ocr_fallback_converter = (
+        create_converter(enable_ocr=True, pdf_backend=PyPdfiumDocumentBackend)
+        if auto_ocr
+        else None
+    )
     runtime = create_chunking_runtime()
     embeddings = create_embeddings()
 
@@ -1725,19 +1825,23 @@ def main() -> None:
         source_id = pdf_path.resolve().relative_to(PDF_DIR.resolve()).as_posix()
         emit_corpus_event("started", source_id=source_id)
         try:
-            result = process_pdf(
-                pdf_path=pdf_path,
-                converter=converter,
-                runtime=runtime,
-                collection=collection,
-                embeddings=embeddings,
-                manifest=manifest,
-                force=args.force,
-                ocr_enabled=ocr_enabled,
-                auto_ocr=auto_ocr,
-                ocr_converter=ocr_converter,
-                commit_gate=args.commit_gate,
-            )
+            with docling_safe_pdf_path(pdf_path) as conversion_path:
+                result = process_pdf(
+                    pdf_path=pdf_path,
+                    converter=converter,
+                    runtime=runtime,
+                    collection=collection,
+                    embeddings=embeddings,
+                    manifest=manifest,
+                    force=args.force,
+                    ocr_enabled=ocr_enabled,
+                    auto_ocr=auto_ocr,
+                    ocr_converter=ocr_converter,
+                    fallback_converter=fallback_converter,
+                    ocr_fallback_converter=ocr_fallback_converter,
+                    docling_pdf_path=conversion_path,
+                    commit_gate=args.commit_gate,
+                )
 
             if result.status == "unchanged":
                 skipped_documents += 1
