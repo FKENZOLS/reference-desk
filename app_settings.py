@@ -513,6 +513,16 @@ OPEN_BROWSER = env_flag(
     True,
 )
 
+WARM_RERANKER_ON_START = env_flag(
+    "RAG_WARM_RERANKER_ON_START",
+    True,
+)
+
+STARTUP_WARM_DELAY_SECONDS = env_float(
+    "RAG_STARTUP_WARM_DELAY_SECONDS",
+    0.5,
+)
+
 SERVER_HOST = os.environ.get(
     "RAG_SERVER_HOST",
     "127.0.0.1",

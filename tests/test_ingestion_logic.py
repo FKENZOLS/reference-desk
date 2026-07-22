@@ -7,6 +7,7 @@ from ingest import (
     convert_page_range_resilient,
     docling_safe_pdf_path,
     ids_fingerprint,
+    infer_document_title,
     infer_retrieval_unit_type,
     index_commit_window,
     is_cuda_out_of_memory,
@@ -56,6 +57,73 @@ def test_consecutive_prefixes_keep_original_order() -> None:
     assert merged[0].content.startswith(
         "Document title\n\nSection name\n\n"
     )
+
+
+def title_record(
+    text: str,
+    *,
+    page: int,
+    label: str = "text",
+    headings: list[str] | None = None,
+) -> ChunkRecord:
+    return ChunkRecord(
+        original_indices=[0],
+        raw_text=text,
+        content=text,
+        headings=list(headings or []),
+        labels=[label],
+        locations=[{"page": page, "label": label}],
+        token_count=len(text.split()),
+    )
+
+
+def test_document_title_uses_page_one_instead_of_later_heading(tmp_path) -> None:
+    records = [
+        title_record("AI Engineering\nChip Huyen", page=1),
+        title_record(
+            "Praise for AI Engineering",
+            page=2,
+            label="title",
+            headings=["Praise for AI Engineering"],
+        ),
+    ]
+
+    assert infer_document_title(records, tmp_path / "fallback.pdf") == "AI Engineering"
+
+
+def test_document_title_prefers_explicit_page_one_title(tmp_path) -> None:
+    records = [
+        title_record("Publisher catalogue", page=1),
+        title_record("The Proper Book Title", page=1, label="title"),
+    ]
+
+    assert infer_document_title(records, tmp_path / "fallback.pdf") == "The Proper Book Title"
+
+
+def test_document_title_falls_back_to_filename_not_later_chapter(tmp_path) -> None:
+    records = [
+        title_record(
+            "Chapter 1: An Incorrect Document Name",
+            page=3,
+            label="title",
+            headings=["Chapter 1: An Incorrect Document Name"],
+        )
+    ]
+
+    assert infer_document_title(records, tmp_path / "Correct_Book_Name.pdf") == "Correct Book Name"
+
+
+def test_later_title_label_cannot_leak_through_cross_page_merge(tmp_path) -> None:
+    merged = title_record(
+        "AI Engineering\nPraise for AI Engineering",
+        page=1,
+        label="text",
+        headings=["Praise for AI Engineering"],
+    )
+    merged.labels.append("title")
+    merged.locations.append({"page": 2, "label": "title"})
+
+    assert infer_document_title([merged], tmp_path / "fallback.pdf") == "AI Engineering"
 
 
 def test_page_window_inherits_previous_section_context() -> None:
@@ -297,6 +365,7 @@ def test_failed_pdf_does_not_stop_remaining_queue(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(ingest, "DEBUG_DIR", tmp_path / "debug")
     monkeypatch.setattr(ingest, "EXPORT_DEBUG_FILES", False)
     monkeypatch.setattr(ingest, "parse_args", lambda: args)
+    monkeypatch.setattr(ingest, "resolved_embedding_revision", lambda: "test-revision")
     monkeypatch.setattr(ingest, "report_cuda_headroom", lambda: None)
     monkeypatch.setattr(ingest, "create_collection", lambda: object())
     monkeypatch.setattr(ingest, "load_manifest", lambda: {})

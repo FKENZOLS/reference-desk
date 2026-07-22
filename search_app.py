@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import base64
 import hashlib
+import importlib
 import io
 import json
 import logging
@@ -34,17 +35,12 @@ from time import perf_counter
 from typing import Any, Iterable, Sequence
 from urllib.parse import quote, urlencode
 
-import chromadb
-import gradio as gr
 import pypdfium2 as pdfium
-import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from app_settings import (
     ADDITIONAL_RESULTS,
@@ -75,6 +71,8 @@ from app_settings import (
     SEARCH_DURING_INGESTION,
     SERVER_HOST,
     SERVER_PORT,
+    STARTUP_WARM_DELAY_SECONDS,
+    WARM_RERANKER_ON_START,
     reranker_configuration,
     reranker_fingerprint,
     resolve_reranker_choice,
@@ -110,6 +108,7 @@ from workspace_store import WorkspaceStore, parse_export_ids
 from workspace_ui import workspace_html
 from quality_ui import quality_dashboard_html
 from corpus_scale import CorpusScaleManager, PAUSED_EXIT_CODE
+from source_updater import SourceUpdateError, apply_source_update, source_update_status
 from reranker_worker import (
     RerankerWorkerClient,
     RerankerWorkerError,
@@ -122,6 +121,66 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 LOGGER = logging.getLogger("document-rag")
+gr: Any = None
+
+
+class _LazyModule:
+    def __init__(self, module_name: str) -> None:
+        self.module_name = module_name
+        self._module: Any | None = None
+
+    def _resolve(self) -> Any:
+        if self._module is None:
+            self._module = importlib.import_module(self.module_name)
+        return self._module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+
+class _LazyClassFactory:
+    def __init__(self, module_name: str, class_name: str) -> None:
+        self.module_name = module_name
+        self.class_name = class_name
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        module = importlib.import_module(self.module_name)
+        return getattr(module, self.class_name)(*args, **kwargs)
+
+
+torch = _LazyModule("torch")
+chromadb = _LazyModule("chromadb")
+Chroma = _LazyClassFactory("langchain_chroma", "Chroma")
+
+
+def _load_gradio() -> Any:
+    """Import the legacy UI only when the compiled React build is absent."""
+
+    global gr
+    if gr is None:
+        import gradio as gradio_module
+
+        gr = gradio_module
+    return gr
+
+
+class _LazyTransformerLoader:
+    """Keep the legacy loader seam without importing Transformers at startup."""
+
+    def __init__(self, class_name: str) -> None:
+        self.class_name = class_name
+
+    def from_pretrained(self, *args: Any, **kwargs: Any) -> Any:
+        import transformers
+
+        loader = getattr(transformers, self.class_name)
+        return loader.from_pretrained(*args, **kwargs)
+
+
+AutoTokenizer = _LazyTransformerLoader("AutoTokenizer")
+AutoModelForSequenceClassification = _LazyTransformerLoader(
+    "AutoModelForSequenceClassification"
+)
 
 
 @dataclass
@@ -509,6 +568,8 @@ _EXPERIMENT_LOCK = threading.Lock()
 _EXPERIMENT_ACTIVE = threading.Event()
 _APP_RESTARTING = threading.Event()
 _APP_INSTANCE_ID = token_urlsafe(8)
+_UPDATE_ACTION_TOKEN = token_urlsafe(24)
+_UPDATE_RESTART_EXIT_CODE = 75
 _DOCUMENT_JOB: dict[str, Any] = {
     "state": "idle",
     "running": False,
@@ -910,6 +971,30 @@ def schedule_application_restart() -> dict[str, Any]:
         daemon=True,
     ).start()
     return {"restarting": True, "instance_id": previous_instance_id}
+
+
+def schedule_source_update_restart() -> bool:
+    """Exit after the API response so start.ps1 can relaunch updated code."""
+
+    if os.environ.get("RAG_UPDATE_SUPERVISED", "").strip() != "1":
+        return False
+
+    def stop_for_update() -> None:
+        threading.Event().wait(1.25)
+        try:
+            _DOCUMENT_MAINTENANCE.set()
+            with _SEARCH_MAINTENANCE_LOCK:
+                _release_search_runtime()
+                _unload_ollama_embedding_model()
+        finally:
+            os._exit(_UPDATE_RESTART_EXIT_CODE)
+
+    threading.Thread(
+        target=stop_for_update,
+        name="source-update-restart",
+        daemon=True,
+    ).start()
+    return True
 
 
 def _run_document_index_job(
@@ -3944,6 +4029,7 @@ def gradio_search(
     previous_result_ids: Sequence[str] | None = None,
     include_result_state: bool = False,
 ) -> tuple[Any, ...]:
+    _load_gradio()
     result_ids: list[str] = []
     try:
         filters = RetrievalFilters(
@@ -4026,6 +4112,7 @@ def toggle_additional_sources(
     expanded: bool,
     count: int,
 ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    _load_gradio()
     next_expanded = not bool(expanded)
     return (
         gr.update(visible=next_expanded),
@@ -4045,8 +4132,18 @@ def normalize_source_filter(source_filter: str | None) -> str | None:
 
 
 def source_choices() -> list[tuple[str, str]]:
-    runtime = get_runtime()
-    result = runtime.collection.get(include=["metadatas"])
+    if _DOCUMENT_MAINTENANCE.is_set():
+        raise DocumentMaintenanceError(
+            "The document index is being updated. Search will resume automatically when it finishes."
+        )
+    if not DB_DIR.exists():
+        return [("All documents", "")]
+    client = chromadb.PersistentClient(path=str(DB_DIR))
+    try:
+        collection = client.get_collection(COLLECTION_NAME)
+    except Exception:
+        return [("All documents", "")]
+    result = collection.get(include=["metadatas"])
     labels: dict[str, str] = {}
     for metadata in result.get("metadatas") or []:
         metadata = metadata or {}
@@ -4149,6 +4246,7 @@ def record_search_history(
 
 
 def refresh_source_dropdown() -> dict[str, Any]:
+    _load_gradio()
     try:
         return gr.update(choices=source_choices())
     except DocumentMaintenanceError:
@@ -4159,6 +4257,7 @@ def refresh_source_dropdown() -> dict[str, Any]:
 
 
 def create_demo() -> gr.Blocks:
+    _load_gradio()
     try:
         choices = source_choices()
     except Exception:
@@ -4895,6 +4994,69 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Notification not found") from error
 
+    def update_payload(*, fetch: bool = False) -> dict[str, Any]:
+        try:
+            payload = source_update_status(fetch=fetch)
+        except SourceUpdateError as error:
+            payload = {
+                "available": False,
+                "can_update": False,
+                "blocked_reason": None,
+                "error": str(error),
+                "supervised_restart": (
+                    os.environ.get("RAG_UPDATE_SUPERVISED", "").strip() == "1"
+                ),
+                "restart_required": False,
+            }
+        payload["action_token"] = _UPDATE_ACTION_TOKEN
+        return payload
+
+    @app.get("/updates/api/status", include_in_schema=False)
+    def source_update_state() -> dict[str, Any]:
+        return update_payload()
+
+    @app.post("/updates/api/check", include_in_schema=False)
+    def check_for_source_update() -> dict[str, Any]:
+        return update_payload(fetch=True)
+
+    @app.post("/updates/api/apply", include_in_schema=False)
+    async def install_source_update(request: Request) -> dict[str, Any]:
+        if document_job_snapshot().get("running"):
+            raise HTTPException(
+                status_code=409,
+                detail="Wait for the current index update to finish before updating the app.",
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+        if not body.get("confirm") or body.get("action_token") != _UPDATE_ACTION_TOKEN:
+            raise HTTPException(status_code=403, detail="Update confirmation expired. Check again.")
+        try:
+            payload = apply_source_update()
+        except SourceUpdateError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        payload["action_token"] = _UPDATE_ACTION_TOKEN
+        if payload.get("updated"):
+            _notify(
+                kind="application_update",
+                title="Application update installed",
+                message=(
+                    f"Updated to {payload.get('remote_short')}. "
+                    + (
+                        "Restarting Reference Desk now."
+                        if payload.get("supervised_restart")
+                        else "Restart Reference Desk to load the new version."
+                    )
+                ),
+                status="success",
+                task_key="application-update",
+            )
+            payload["restart_scheduled"] = schedule_source_update_restart()
+        else:
+            payload["restart_scheduled"] = False
+        return payload
+
     @app.get("/api/diagnostics/export", include_in_schema=False)
     def export_diagnostics() -> Response:
         stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
@@ -5405,6 +5567,14 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
     def experiments_page() -> Response:
         return frontend_page("<h1>Evaluation experiments</h1>")
 
+    @app.get(
+        "/updates",
+        response_class=Response,
+        include_in_schema=False,
+    )
+    def updates_page() -> Response:
+        return frontend_page("<h1>Application updates</h1>")
+
     @app.get("/quality/api/experiments", include_in_schema=False)
     def quality_experiment_state() -> dict[str, Any]:
         feedback_benchmarks = []
@@ -5829,11 +5999,46 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         return app
 
     fallback_demo = demo or create_demo()
-    return gr.mount_gradio_app(app, fallback_demo, path="/")
+    return _load_gradio().mount_gradio_app(app, fallback_demo, path="/")
 
 
 def launch_gradio() -> None:
     app = create_web_app()
+    if WARM_RERANKER_ON_START:
+        startup_choice = configured_default_reranker_choice()
+        startup_configuration = reranker_configuration(startup_choice)
+        _set_reranker_state(
+            status="loading",
+            choice=startup_choice,
+            model=str(startup_configuration["model"]),
+            message=f"Loading {startup_configuration['label']} in the background…",
+            load_seconds=0.0,
+            preflight_tokens=0,
+        )
+
+        def warm_search_runtime() -> None:
+            try:
+                get_runtime()
+            except DocumentMaintenanceError:
+                LOGGER.info("Skipped startup reranker warmup during document maintenance")
+                _set_reranker_state(
+                    status="idle",
+                    message="Background loading is waiting for document indexing to finish.",
+                )
+            except (FileNotFoundError, RuntimeError, RerankerWorkerError) as error:
+                LOGGER.warning("Startup reranker warmup was unavailable: %s", error)
+                if reranker_runtime_status().get("status") == "loading":
+                    _set_reranker_state(
+                        status="idle",
+                        message=f"Background loading is waiting: {error}",
+                    )
+
+        warmup = threading.Timer(
+            max(0.0, STARTUP_WARM_DELAY_SECONDS),
+            warm_search_runtime,
+        )
+        warmup.daemon = True
+        warmup.start()
     if OPEN_BROWSER:
         browser_host = "127.0.0.1" if SERVER_HOST in {"0.0.0.0", "::"} else SERVER_HOST
         threading.Timer(

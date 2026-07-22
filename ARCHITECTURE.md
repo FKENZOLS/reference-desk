@@ -32,6 +32,7 @@ every product feature should preserve a route back to the original document.
 | `lexical_index.py` | SQLite FTS schema, query lanes, and lexical persistence | Dense retrieval |
 | `search_app.py` | Runtime lifecycle, hybrid retrieval, reranking, citations, JSON APIs, PDF viewer | Document file mutations |
 | `reranker_worker.py` | Spawned reranker process, IPC, timeouts, and worker recovery | Search ranking policy or FastAPI routes |
+| `source_updater.py` | Read-only Git status plus explicit fast-forward update policy | Resets, conflict resolution, or local-data migration |
 | `frontend/src/` | React pages and local shadcn-style presentation components | Retrieval, persistence, or GPU lifecycle |
 | `frontend/dist/` | Checked-in production UI bundle served by FastAPI | Hand-edited source |
 | `document_manager.py` | Safe PDF repository operations and legacy HTML fallback | Chroma ingestion internals |
@@ -79,6 +80,12 @@ workspace matters.
    SQLite FTS, and the manifest switch one source revision together.
 7. Citation metadata must retain page and bounding-box provenance when Docling
    provides it.
+8. UI updates may only fast-forward a clean tracked checkout. They must never
+   reset, force-checkout, merge divergent history, or include ignored runtime
+   data. The API confirmation token prevents another browser origin from
+   triggering an update blindly.
+   Document titles may come only from credible page-one evidence or the source
+   filename; inherited headings from later pages are never document metadata.
 8. Workspace data is independent from ingestion and must survive index rebuilds.
 9. Wrong-result labels are hard negatives; only explicit no-result judgments may create unanswerable benchmark cases.
 10. Learned rejection remains inactive until both configured label minimums are met.
@@ -116,8 +123,10 @@ workspace matters.
 
 ### Search
 
-1. Load the Chroma collection, embedding client, and lexical state, then spawn
-   the startup reranker worker. Rebuild GTE's position buffer and run a
+1. Serve the compiled React interface and read source metadata without creating
+   the search runtime or importing PyTorch, Transformers, Chroma, LangChain, or
+   Gradio. Warm the Chroma collection, embedding client, lexical state, and
+   startup reranker in the background. Rebuild GTE's position buffer and run a
    realistic preflight inside that worker before reporting it ready.
 2. Analyze deterministic query signals and allocate dense, lexical, and rerank
    candidates. Retrieve the two lanes independently.

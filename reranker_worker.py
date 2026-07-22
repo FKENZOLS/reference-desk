@@ -8,6 +8,7 @@ discarded without restarting FastAPI or losing browser state.
 from __future__ import annotations
 
 import multiprocessing as mp
+import importlib
 import os
 import threading
 import traceback
@@ -15,15 +16,42 @@ from multiprocessing.connection import Connection
 from time import perf_counter
 from typing import Any, Sequence
 
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
 from app_settings import (
     RERANKER_CHOICE,
     RERANKER_USE_AUTH,
     reranker_configuration,
     reranker_fingerprint,
     resolve_reranker_backend,
+)
+
+
+class _LazyModule:
+    def __init__(self, module_name: str) -> None:
+        self.module_name = module_name
+        self._module: Any | None = None
+
+    def _resolve(self) -> Any:
+        if self._module is None:
+            self._module = importlib.import_module(self.module_name)
+        return self._module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+
+class _LazyTransformerLoader:
+    def __init__(self, class_name: str) -> None:
+        self.class_name = class_name
+
+    def from_pretrained(self, *args: Any, **kwargs: Any) -> Any:
+        transformers = importlib.import_module("transformers")
+        return getattr(transformers, self.class_name).from_pretrained(*args, **kwargs)
+
+
+torch = _LazyModule("torch")
+AutoTokenizer = _LazyTransformerLoader("AutoTokenizer")
+AutoModelForSequenceClassification = _LazyTransformerLoader(
+    "AutoModelForSequenceClassification"
 )
 from rag_common import COMPUTE_BACKEND, RERANKER_DEVICE
 

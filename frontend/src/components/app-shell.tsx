@@ -13,6 +13,7 @@ const primaryLinks = [
 const advancedLinks = [
   { to: "/quality", label: "Quality" },
   { to: "/experiments", label: "Experiments" },
+  { to: "/updates", label: "Software updates" },
 ]
 
 export function AppShell({ children }: { children: ReactNode }) {

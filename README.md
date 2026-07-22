@@ -113,7 +113,12 @@ If automatic detection selects the wrong backend, replace `auto` with `rocm`,
 
 Open **Filters and search within results** to switch between the BGE and
 multilingual GTE rerankers. GTE is loaded and validated by default in an
-isolated GPU worker. The first
+isolated GPU worker. The React interface and document list become available
+first; GTE warms in the background so model loading does not hold up the
+browser. PyTorch, Transformers, Chroma, LangChain, and the legacy Gradio UI are
+also excluded from the web-bootstrap import path. The Search page reports GTE
+as background-loading immediately; the default warmup begins after 0.5 seconds.
+The first
 search after switching can take longer
 while the selected model loads. Reference Desk keeps only one reranker loaded
 at a time to avoid multiplying GPU memory use. If CUDA inference crashes, the
@@ -126,7 +131,7 @@ The default Search interface stays focused on the passages and source actions.
 Detailed retrieval diagnostics remain available through the filters panel.
 
 Open the collapsed **Advanced** section at the bottom of the sidebar to reach
-**Quality** and **Experiments**. Experiments can import a JSONL benchmark or use complete cases built
+**Quality**, **Experiments**, and **Software updates**. Experiments can import a JSONL benchmark or use complete cases built
 from relevance feedback. You can compare GTE and BGE on the same candidate
 pool, vary candidate count, reranker weight, and passage mode, then save the
 results. Selecting **Use in production** applies that completed experiment's
@@ -166,11 +171,19 @@ After upgrading, open **Documents** and choose **Reindex all** once so existing
 PDFs receive the new structural metadata. Local state migrations create a
 small `pre-v*-migration.bak` snapshot before changing an older schema.
 
-If you installed with Git, open PowerShell in the `reference-desk` folder and
-run:
+If you installed with Git, open **Advanced → Software updates**. The page checks
+the configured tracking branch on GitHub and can install a clean fast-forward
+update. It refuses to overwrite tracked source edits or merge diverged history.
+When Reference Desk was opened with `START.bat` or `start.ps1`, it restarts
+automatically and refreshes dependencies only when their configuration changed.
+PDFs, indexes, backups, settings, benchmarks, and workspace data are ignored by
+Git and remain in place.
+
+The equivalent manual update is:
 
 ```powershell
-git pull --ff-only
+git fetch --prune
+git merge --ff-only '@{upstream}'
 powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend auto
 ```
 
@@ -325,6 +338,13 @@ Small children make precise matches easier, while the parent prevents an
 isolated sentence from losing its heading or surrounding explanation. Every
 child stores its parent identity and provenance, so a match can expand back to
 the readable passage and exact PDF region.
+
+Document names use the first credible title detected on physical page 1. The
+resolver prefers an explicit Docling title, then a page-1 heading, then the
+first meaningful page-1 text line. It never promotes a heading from page 2 or
+later to the title of the whole book; image-only covers fall back to the PDF
+filename. After upgrading an existing collection, select **Reindex all** once
+to rewrite previously stored titles.
 
 ### Hybrid retrieval and reciprocal-rank fusion
 

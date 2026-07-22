@@ -12,6 +12,7 @@ wheels/
 release/
 .rag-profile
 .env
+.reference-desk-update.json
 
 # Virtual environments
 .venv/

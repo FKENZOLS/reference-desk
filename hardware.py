@@ -7,8 +7,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-import torch
-
 
 PROJECT_DIR = Path(__file__).resolve().parent
 PROFILE_PATH = PROJECT_DIR / ".rag-profile"
@@ -20,6 +18,12 @@ _ALIASES = {
     "": "auto",
 }
 VALID_ACCELERATORS = {"auto", "cuda", "rocm", "cpu"}
+
+
+def _torch_module() -> Any:
+    import torch
+
+    return torch
 
 
 @dataclass(frozen=True)
@@ -65,7 +69,8 @@ def configured_accelerator(
     return normalize_accelerator(saved)
 
 
-def detected_accelerator(torch_module: Any = torch) -> str:
+def detected_accelerator(torch_module: Any = None) -> str:
+    torch_module = torch_module or _torch_module()
     if not bool(torch_module.cuda.is_available()):
         return "cpu"
     version = getattr(torch_module, "version", None)
@@ -74,7 +79,8 @@ def detected_accelerator(torch_module: Any = torch) -> str:
     return "cuda"
 
 
-def runtime_version(backend: str, torch_module: Any = torch) -> str:
+def runtime_version(backend: str, torch_module: Any = None) -> str:
+    torch_module = torch_module or _torch_module()
     version = getattr(torch_module, "version", None)
     if backend == "rocm":
         return str(getattr(version, "hip", None) or "unknown")
@@ -85,8 +91,9 @@ def runtime_version(backend: str, torch_module: Any = torch) -> str:
 
 def resolve_accelerator(
     requested: str | None,
-    torch_module: Any = torch,
+    torch_module: Any = None,
 ) -> str:
+    torch_module = torch_module or _torch_module()
     normalized = normalize_accelerator(requested)
     detected = detected_accelerator(torch_module)
     if normalized == "auto":
@@ -121,8 +128,9 @@ def torch_device_for(backend: str, index: int = 0) -> str:
 
 def accelerator_info(
     requested: str | None = None,
-    torch_module: Any = torch,
+    torch_module: Any = None,
 ) -> AcceleratorInfo:
+    torch_module = torch_module or _torch_module()
     configured = normalize_accelerator(requested or configured_accelerator())
     backend = resolve_accelerator(configured, torch_module)
     available = backend != "cpu"

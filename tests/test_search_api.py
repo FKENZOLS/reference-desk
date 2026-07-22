@@ -90,9 +90,121 @@ def test_reranker_options_and_invalid_choice() -> None:
         "bge",
         "gte",
     }
-
     invalid = client.post(
         "/api/search",
         json={"query": "station dwell time", "reranker_choice": "unknown"},
     )
     assert invalid.status_code == 400
+
+
+def test_source_update_api_requires_fresh_confirmation(monkeypatch) -> None:
+    status = {
+        "available": True,
+        "can_update": True,
+        "blocked_reason": None,
+        "supervised_restart": False,
+        "restart_required": False,
+    }
+    monkeypatch.setattr(search_app, "source_update_status", lambda fetch=False: dict(status))
+    monkeypatch.setattr(search_app, "apply_source_update", lambda: {**status, "updated": False})
+    client = TestClient(search_app.create_web_app(gr.Blocks()))
+
+    current = client.get("/updates/api/status")
+    assert current.status_code == 200
+    token = current.json()["action_token"]
+    denied = client.post(
+        "/updates/api/apply",
+        json={"confirm": True, "action_token": "wrong"},
+    )
+    assert denied.status_code == 403
+    accepted = client.post(
+        "/updates/api/apply",
+        json={"confirm": True, "action_token": token},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["updated"] is False
+
+
+def test_source_choices_do_not_start_the_search_runtime(tmp_path, monkeypatch) -> None:
+    class FakeCollection:
+        @staticmethod
+        def get(*, include):
+            assert include == ["metadatas"]
+            return {
+                "metadatas": [
+                    {
+                        "source_id": "standards/manual.pdf",
+                        "document_title": "Transit specification",
+                    }
+                ]
+            }
+
+    class FakeClient:
+        @staticmethod
+        def get_collection(name):
+            assert name == search_app.COLLECTION_NAME
+            return FakeCollection()
+
+    database = tmp_path / "chroma"
+    database.mkdir()
+    monkeypatch.setattr(search_app, "DB_DIR", database)
+    monkeypatch.setattr(
+        search_app,
+        "get_runtime",
+        lambda: (_ for _ in ()).throw(AssertionError("runtime must stay lazy")),
+    )
+    monkeypatch.setattr(
+        search_app.chromadb,
+        "PersistentClient",
+        lambda **kwargs: FakeClient(),
+    )
+    search_app._DOCUMENT_MAINTENANCE.clear()
+
+    assert search_app.source_choices() == [
+        ("All documents", ""),
+        ("Transit specification — standards/manual.pdf", "standards/manual.pdf"),
+    ]
+
+
+def test_server_schedules_reranker_warmup_without_blocking_launch(monkeypatch) -> None:
+    events = []
+
+    class ImmediateTimer:
+        def __init__(self, interval, function):
+            events.append(("scheduled", interval))
+            self.function = function
+            self.daemon = False
+
+        def start(self):
+            events.append(("timer_started", self.daemon))
+            self.function()
+
+    fake_app = object()
+    monkeypatch.setattr(search_app, "create_web_app", lambda: fake_app)
+    monkeypatch.setattr(search_app, "get_runtime", lambda: events.append(("warmed", True)))
+    monkeypatch.setattr(
+        search_app,
+        "_set_reranker_state",
+        lambda **values: events.append(("state", values)),
+    )
+    monkeypatch.setattr(search_app.threading, "Timer", ImmediateTimer)
+    monkeypatch.setattr(search_app, "WARM_RERANKER_ON_START", True)
+    monkeypatch.setattr(search_app, "STARTUP_WARM_DELAY_SECONDS", 2.0)
+    monkeypatch.setattr(search_app, "OPEN_BROWSER", False)
+    monkeypatch.setattr(
+        search_app.uvicorn,
+        "run",
+        lambda app, host, port: events.append(("served", app, host, port)),
+    )
+
+    search_app.launch_gradio()
+
+    assert events[0][0] == "state"
+    assert events[0][1]["status"] == "loading"
+    assert "background" in events[0][1]["message"]
+    assert events[1:] == [
+        ("scheduled", 2.0),
+        ("timer_started", True),
+        ("warmed", True),
+        ("served", fake_app, search_app.SERVER_HOST, search_app.SERVER_PORT),
+    ]

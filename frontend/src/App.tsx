@@ -10,6 +10,7 @@ import { DocumentsPage } from "@/pages/documents-page"
 import { ExperimentsPage } from "@/pages/experiments-page"
 import { QualityPage } from "@/pages/quality-page"
 import { SearchPage } from "@/pages/search-page"
+import { UpdatesPage } from "@/pages/updates-page"
 import { WorkspacePage } from "@/pages/workspace-page"
 
 function isViewerUrl(url: URL): boolean {
@@ -32,7 +33,9 @@ export default function App() {
       : path === "/workspace"
         ? <WorkspacePage />
         : path === "/experiments"
-          ? <ExperimentsPage />
+        ? <ExperimentsPage />
+        : path === "/updates"
+          ? <UpdatesPage />
         : path === "/quality"
           ? <QualityPage />
           : <SearchPage />

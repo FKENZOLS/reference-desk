@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import urllib.error
 import urllib.request
 from functools import lru_cache
@@ -13,7 +14,6 @@ from pathlib import Path
 from typing import Iterable
 
 from langchain_core.embeddings import Embeddings
-from langchain_ollama import OllamaEmbeddings
 from hardware import (
     accelerator_info,
     configured_accelerator,
@@ -45,9 +45,38 @@ EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 # PyTorch ROCm intentionally uses the same ``torch.cuda`` device strings as
 # NVIDIA CUDA. Keep the vendor backend separate from the physical device name.
 REQUESTED_ACCELERATOR = configured_accelerator()
-COMPUTE_BACKEND = resolve_accelerator(REQUESTED_ACCELERATOR)
+# The setup/doctor workflow validates explicit profiles. Defer importing
+# PyTorch when the installed profile already names its backend; auto detection
+# still resolves eagerly because no portable choice has been recorded yet.
+COMPUTE_BACKEND = (
+    "cuda"
+    if REQUESTED_ACCELERATOR == "auto" and shutil.which("nvidia-smi")
+    else (
+        resolve_accelerator(REQUESTED_ACCELERATOR)
+        if REQUESTED_ACCELERATOR == "auto"
+        else REQUESTED_ACCELERATOR
+    )
+)
 COMPUTE_DEVICE = torch_device_for(COMPUTE_BACKEND)
-HARDWARE = accelerator_info(REQUESTED_ACCELERATOR)
+
+
+class _LazyHardwareInfo:
+    def __init__(self) -> None:
+        self._value = None
+
+    def _resolve(self):
+        if self._value is None:
+            self._value = accelerator_info(REQUESTED_ACCELERATOR)
+        return self._value
+
+    def as_dict(self) -> dict[str, object]:
+        return self._resolve().as_dict()
+
+    def __getattr__(self, name: str):
+        return getattr(self._resolve(), name)
+
+
+HARDWARE = _LazyHardwareInfo()
 
 
 def _component_device(environment_name: str) -> str:
@@ -168,6 +197,8 @@ class OllamaRetrievalEmbeddings(Embeddings):
         num_gpu: int = OLLAMA_NUM_GPU,
         keep_alive: int = OLLAMA_KEEP_ALIVE,
     ) -> None:
+        from langchain_ollama import OllamaEmbeddings
+
         self._ollama = OllamaEmbeddings(
             model=model,
             base_url=base_url,

@@ -1,3 +1,5 @@
+import json
+import subprocess
 import sys
 
 import main as main_module
@@ -29,3 +31,29 @@ def test_serve_runs_in_launcher_process(monkeypatch) -> None:
 
     assert main(["serve"]) == 0
     assert launched == [True]
+
+
+def test_web_bootstrap_does_not_import_search_engines() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys, search_app; "
+                "print(json.dumps({name: name in sys.modules for name in "
+                "('torch','transformers','chromadb','langchain_chroma','gradio')}))"
+            ),
+        ],
+        cwd=PROJECT_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "torch": False,
+        "transformers": False,
+        "chromadb": False,
+        "langchain_chroma": False,
+        "gradio": False,
+    }

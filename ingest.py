@@ -150,7 +150,7 @@ EXPORT_DEBUG_FILES = True
 INDEX_COMMIT_WAIT_SECONDS = 120
 
 # Increment whenever chunking, prompts, or metadata change materially.
-INGESTION_VERSION = "docling-hybrid-structural-v7-qwen"
+INGESTION_VERSION = "docling-hybrid-structural-v8-page1-title-qwen"
 MANIFEST_SCHEMA_VERSION = 2
 
 
@@ -983,13 +983,89 @@ def infer_document_title(
     records: list[ChunkRecord],
     pdf_path: Path,
 ) -> str:
-    for record in records[:5]:
-        if record.headings:
-            return record.headings[0]
-        if "title" in record.labels and record.raw_text:
-            return record.raw_text.splitlines()[0][:300]
+    """Resolve a bibliographic label without promoting later chapter headings.
 
-    return pdf_path.stem
+    Docling's ``headings`` describe hierarchy and are inherited by following
+    chunks. They are not document metadata. Restricting candidates to physical
+    page one prevents a heading from page two or three (for example, a praise,
+    contents, or chapter heading) from becoming the title of the whole book.
+    """
+
+    def location_page(location: dict[str, Any]) -> int | None:
+        try:
+            return int(location.get("page"))
+        except (TypeError, ValueError):
+            return None
+
+    def record_pages(record: ChunkRecord) -> set[int]:
+        return {
+            page
+            for location in record.locations
+            if (page := location_page(location)) is not None
+        }
+
+    def is_on_first_page(record: ChunkRecord) -> bool:
+        for location in record.locations:
+            if location_page(location) == 1:
+                return True
+        return False
+
+    def has_page_one_title_label(record: ChunkRecord) -> bool:
+        return any(
+            location_page(location) == 1
+            and str(location.get("label") or "").casefold().rsplit(".", 1)[-1]
+            == "title"
+            for location in record.locations
+        )
+
+    def candidate_line(value: str) -> str:
+        for raw_line in clean_text(value).splitlines():
+            line = re.sub(r"^[#>*_`\s]+|[#>*_`\s]+$", "", raw_line).strip()
+            normalized = line.casefold()
+            if not line or PAGE_NUMBER_ONLY.fullmatch(line):
+                continue
+            if normalized in {"contents", "table of contents"}:
+                continue
+            if normalized.startswith(
+                ("isbn", "copyright", "©", "edited by ", "http://", "https://", "www.")
+            ):
+                continue
+            if len(line) > 300 or sum(character.isalpha() for character in line) < 2:
+                continue
+            return line[:300]
+        return ""
+
+    page_one_records = [record for record in records if is_on_first_page(record)]
+
+    # Prefer an explicit title item detected on the first physical page.
+    for record in page_one_records:
+        labels = {label.casefold().rsplit(".", 1)[-1] for label in record.labels}
+        if has_page_one_title_label(record) or (
+            "title" in labels and record_pages(record) == {1}
+        ):
+            title = candidate_line(record.raw_text)
+            if title:
+                return title
+
+    # A page-one heading is still useful, but a later-page heading never is.
+    for record in page_one_records:
+        if record_pages(record) != {1}:
+            continue
+        for heading in record.headings:
+            title = candidate_line(heading)
+            if title:
+                return title
+
+    # Some cover pages are classified as plain text or code. Use their first
+    # meaningful visible line rather than continuing into later pages.
+    for record in page_one_records:
+        title = candidate_line(record.raw_text)
+        if title:
+            return title
+
+    # Image-only covers may not expose text when OCR is unavailable. The file
+    # name is safer than guessing from a chapter heading on another page.
+    return clean_text(pdf_path.stem.replace("_", " "))[:300] or "Untitled document"
 
 
 def records_to_langchain(
