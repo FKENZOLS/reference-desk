@@ -524,6 +524,7 @@ _DOCUMENT_JOB: dict[str, Any] = {
 _INDEX_COMMIT_BARRIER_LOCK = threading.Lock()
 _INDEX_COMMIT_BARRIER: _IndexCommitBarrier | None = None
 _INDEX_COMMIT_GATE_PATH: Path | None = None
+GPU_HEADROOM_GUARD_MARKER = "RAG_GPU_HEADROOM_GUARD_FAILED"
 
 
 class DocumentMaintenanceError(RuntimeError):
@@ -955,6 +956,8 @@ def _run_document_index_job(
                 command.extend(("--source", source_id))
         if force:
             command.append("--force")
+        exclusive_command = list(command)
+        exclusive_prune_command = list(prune_command) if managed_queue else []
         environment = os.environ.copy()
         environment["RAG_OPEN_BROWSER"] = "0"
         if search_available:
@@ -978,26 +981,97 @@ def _run_document_index_job(
                 else "Starting document ingestion."
             ),
         )
-        process = subprocess.Popen(
+
+        def run_ingestion_process(
+            process_command: list[str],
+            process_environment: dict[str, str],
+        ) -> tuple[int, bool, bool]:
+            process = subprocess.Popen(
+                process_command,
+                cwd=str(Path(__file__).resolve().parent),
+                env=process_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=_subprocess_creation_flags(),
+            )
+            assert process.stdout is not None
+            emitted_events = False
+            headroom_guard_failed = False
+            for line in process.stdout:
+                if GPU_HEADROOM_GUARD_MARKER in line:
+                    headroom_guard_failed = True
+                    # The auto-mode parent replaces the marker and the child
+                    # traceback that follows it with one concise transition.
+                    continue
+                if headroom_guard_failed:
+                    continue
+                if _handle_corpus_event(line):
+                    emitted_events = True
+                else:
+                    _append_document_job_log(line)
+            return process.wait(), emitted_events, headroom_guard_failed
+
+        exit_code, structured_events, headroom_guard_failed = run_ingestion_process(
             command,
-            cwd=str(Path(__file__).resolve().parent),
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=_subprocess_creation_flags(),
+            environment,
         )
-        assert process.stdout is not None
-        structured_events = False
-        for line in process.stdout:
-            if _handle_corpus_event(line):
-                structured_events = True
-            else:
-                _append_document_job_log(line)
-        exit_code = process.wait()
+
+        if (
+            exit_code != 0
+            and search_available
+            and SEARCH_DURING_INGESTION == "auto"
+            and headroom_guard_failed
+        ):
+            _append_document_job_log(
+                "GPU availability changed before Docling started. "
+                "Switching to exclusive ingestion automatically."
+            )
+            _DOCUMENT_MAINTENANCE.set()
+            _release_index_commit_barrier()
+            if commit_gate is not None:
+                commit_gate.unlink(missing_ok=True)
+            with _INDEX_COMMIT_BARRIER_LOCK:
+                if _INDEX_COMMIT_GATE_PATH == commit_gate:
+                    _INDEX_COMMIT_GATE_PATH = None
+            commit_gate = None
+
+            with _SEARCH_MAINTENANCE_LOCK:
+                _update_document_job(
+                    state="preparing",
+                    search_available=False,
+                    concurrency_reason=(
+                        "Concurrent startup lost GPU headroom; the queue was "
+                        "retried in exclusive mode."
+                    ),
+                    message="Freeing GPU memory and continuing indexing.",
+                )
+                _release_search_runtime()
+                _unload_ollama_embedding_model()
+
+            search_available = False
+            environment = os.environ.copy()
+            environment["RAG_OPEN_BROWSER"] = "0"
+            environment["RAG_GPU_HEADROOM_WARNING_MB"] = str(
+                DOCLING_GPU_HEADROOM_MB
+            )
+            command = exclusive_command
+            if managed_queue:
+                prune_command = exclusive_prune_command
+            _update_document_job(
+                state="running",
+                message="Indexing documents with search temporarily paused.",
+            )
+            retry_exit_code, retry_events, _ = run_ingestion_process(
+                command,
+                environment,
+            )
+            exit_code = retry_exit_code
+            structured_events = structured_events or retry_events
+
         if exit_code != 0 and managed_queue:
             queue_after_run = CORPUS_SCALE.snapshot()
             quarantine_count = int(

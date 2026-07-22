@@ -21,6 +21,7 @@ from ingest import (
 from types import SimpleNamespace
 
 import pytest
+import ingest
 
 
 class FakeRuntime:
@@ -226,7 +227,7 @@ def test_cuda_oom_is_recognized_and_reports_recovery(tmp_path) -> None:
         )
 
 
-def test_low_cuda_headroom_stops_before_conversion(monkeypatch) -> None:
+def test_low_cuda_headroom_stops_before_conversion(monkeypatch, capsys) -> None:
     monkeypatch.setattr("ingest.DOCLING_DEVICE", "cuda")
     monkeypatch.setattr("ingest.CUDA_HEADROOM_WARNING_MB", 3500)
     monkeypatch.setattr("ingest.ALLOW_LOW_CUDA_HEADROOM", False)
@@ -237,6 +238,7 @@ def test_low_cuda_headroom_stops_before_conversion(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match=r"ollama stop qwen3-embedding:0\.6b"):
         report_cuda_headroom()
+    assert "RAG_GPU_HEADROOM_GUARD_FAILED free_mib=2800 required_mib=3500" in capsys.readouterr().out
 
 
 def test_index_commit_window_waits_for_the_app_permission(tmp_path, monkeypatch) -> None:
@@ -270,3 +272,61 @@ def test_index_commit_window_waits_for_the_app_permission(tmp_path, monkeypatch)
         "commit_finished",
         {"source_id": "manual.pdf", "token": "commit-token", "status": "complete"},
     )
+
+
+def test_failed_pdf_does_not_stop_remaining_queue(tmp_path, monkeypatch) -> None:
+    pdf_dir = tmp_path / "docs"
+    pdf_dir.mkdir()
+    (pdf_dir / "broken.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    (pdf_dir / "working.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    processed = []
+    events = []
+
+    args = SimpleNamespace(
+        source=[],
+        queue_managed=False,
+        prune=False,
+        queue_control=None,
+        ocr=False,
+        no_auto_ocr=False,
+        force=False,
+        commit_gate=None,
+    )
+    monkeypatch.setattr(ingest, "PDF_DIR", pdf_dir)
+    monkeypatch.setattr(ingest, "DB_DIR", tmp_path / "db")
+    monkeypatch.setattr(ingest, "DEBUG_DIR", tmp_path / "debug")
+    monkeypatch.setattr(ingest, "EXPORT_DEBUG_FILES", False)
+    monkeypatch.setattr(ingest, "parse_args", lambda: args)
+    monkeypatch.setattr(ingest, "report_cuda_headroom", lambda: None)
+    monkeypatch.setattr(ingest, "create_collection", lambda: object())
+    monkeypatch.setattr(ingest, "load_manifest", lambda: {})
+    monkeypatch.setattr(ingest, "create_converter", lambda **kwargs: object())
+    monkeypatch.setattr(
+        ingest,
+        "create_chunking_runtime",
+        lambda: SimpleNamespace(tokenizer_name="test-tokenizer"),
+    )
+    monkeypatch.setattr(ingest, "create_embeddings", lambda: object())
+    monkeypatch.setattr(ingest, "synchronize_lexical_index", lambda collection: None)
+    monkeypatch.setattr(
+        ingest,
+        "emit_corpus_event",
+        lambda event, **values: events.append((event, values)),
+    )
+
+    def process_pdf(**values):
+        name = values["pdf_path"].name
+        processed.append(name)
+        if name == "broken.pdf":
+            raise ValueError("damaged cross-reference table")
+        return SimpleNamespace(status="indexed", chunks=3)
+
+    monkeypatch.setattr(ingest, "process_pdf", process_pdf)
+
+    with pytest.raises(SystemExit) as stopped:
+        ingest.main()
+
+    assert stopped.value.code == 1
+    assert processed == ["broken.pdf", "working.pdf"]
+    assert any(event == "failed" and values["source_id"] == "broken.pdf" for event, values in events)
+    assert any(event == "completed" and values["source_id"] == "working.pdf" for event, values in events)

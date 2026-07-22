@@ -393,3 +393,69 @@ def test_successful_background_job_clears_pending_changes(monkeypatch) -> None:
     assert cleared == [True]
     assert search_app.document_job_snapshot()["state"] == "complete"
     assert not search_app._DOCUMENT_MAINTENANCE.is_set()
+
+
+def test_auto_indexing_retries_exclusively_when_gpu_headroom_changes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    launches = []
+    released = []
+    cleared = []
+    process_results = [
+        ([f"{search_app.GPU_HEADROOM_GUARD_MARKER} free_mib=3757 required_mib=4268\n"], 1),
+        (["Processing: manual.pdf\n", "Ingestion complete\n"], 0),
+    ]
+
+    class FakeProcess:
+        def __init__(self, lines, exit_code):
+            self.stdout = iter(lines)
+            self.exit_code = exit_code
+
+        def wait(self):
+            return self.exit_code
+
+    def launch(command, **kwargs):
+        launches.append((list(command), dict(kwargs["env"])))
+        lines, exit_code = process_results.pop(0)
+        return FakeProcess(lines, exit_code)
+
+    fake_repository = SimpleNamespace(clear_pending=lambda: cleared.append(True))
+    monkeypatch.setattr(search_app, "DOCUMENT_REPOSITORY", fake_repository)
+    monkeypatch.setattr(search_app, "DB_DIR", tmp_path)
+    monkeypatch.setattr(search_app, "SEARCH_DURING_INGESTION", "auto")
+    monkeypatch.setattr(search_app, "DOCLING_GPU_HEADROOM_MB", 3500)
+    monkeypatch.setattr(search_app, "CONCURRENT_QUERY_RESERVE_MB", 768)
+    monkeypatch.setattr(
+        search_app,
+        "_release_search_runtime",
+        lambda: released.append("search"),
+    )
+    monkeypatch.setattr(
+        search_app,
+        "_unload_ollama_embedding_model",
+        lambda: released.append("ollama"),
+    )
+    monkeypatch.setattr(search_app.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        search_app,
+        "_DOCUMENT_JOB",
+        {"state": "queued", "running": True, "message": "", "log": []},
+    )
+    monkeypatch.setattr(search_app, "_INDEX_COMMIT_GATE_PATH", None)
+    search_app._DOCUMENT_MAINTENANCE.clear()
+
+    search_app._run_document_index_job(False, search_available=True)
+
+    assert len(launches) == 2
+    assert "--commit-gate" in launches[0][0]
+    assert "--commit-gate" not in launches[1][0]
+    assert launches[0][1]["RAG_GPU_HEADROOM_WARNING_MB"] == "4268"
+    assert launches[1][1]["RAG_GPU_HEADROOM_WARNING_MB"] == "3500"
+    assert released == ["search", "ollama"]
+    assert cleared == [True]
+    job = search_app.document_job_snapshot()
+    assert job["state"] == "complete"
+    assert job["search_available"] is False
+    assert "retried in exclusive mode" in job["concurrency_reason"]
+    assert not search_app._DOCUMENT_MAINTENANCE.is_set()

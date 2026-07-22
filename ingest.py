@@ -136,6 +136,7 @@ ALLOW_LOW_CUDA_HEADROOM = os.environ.get(
     "RAG_ALLOW_LOW_GPU_HEADROOM",
     os.environ.get("RAG_ALLOW_LOW_CUDA_HEADROOM", "0"),
 ) == "1"
+GPU_HEADROOM_GUARD_MARKER = "RAG_GPU_HEADROOM_GUARD_FAILED"
 
 ENABLE_OCR = False
 AUTO_OCR = True
@@ -280,6 +281,14 @@ def report_cuda_headroom() -> None:
         f"{free_mb} MiB free / {total_mb} MiB total"
     )
     if free_mb < CUDA_HEADROOM_WARNING_MB:
+        # The supervising application uses this stable marker to distinguish a
+        # startup headroom race from a document conversion failure. In auto
+        # mode it can then unload search and retry the same queue exclusively.
+        print(
+            f"{GPU_HEADROOM_GUARD_MARKER} "
+            f"free_mib={free_mb} required_mib={CUDA_HEADROOM_WARNING_MB}",
+            flush=True,
+        )
         message = (
             f"Only {free_mb} MiB of GPU memory is free; at least "
             f"{CUDA_HEADROOM_WARNING_MB} MiB is required by the ingestion "
@@ -1982,6 +1991,10 @@ def main() -> None:
                 error_type=type(error).__name__,
                 error=str(error),
             )
+            # A malformed or unsupported PDF belongs to this queue item, not
+            # the whole ingestion run. The parent quarantines it while this
+            # worker proceeds to the next selected source.
+            continue
 
     pruned_documents = 0
     with index_commit_window(args.commit_gate, "__corpus_prune__"):

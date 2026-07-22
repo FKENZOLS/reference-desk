@@ -73,6 +73,8 @@ workspace matters.
 6. Search and ingestion may share a GPU only when live free VRAM covers the
    Docling headroom plus a query reserve. Otherwise ingestion releases search
    models and runs exclusively; total VRAM alone is not the deciding factor.
+   If the child detects that headroom disappeared after the parent's check,
+   auto mode must release search and retry the same queue once exclusively.
    When concurrent, an app-controlled commit gate pauses search while Chroma,
    SQLite FTS, and the manifest switch one source revision together.
 7. Citation metadata must retain page and bounding-box provenance when Docling

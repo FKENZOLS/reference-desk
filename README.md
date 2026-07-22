@@ -234,11 +234,19 @@ workloads do not fit at that moment.
 By default, Reference Desk measures free GPU memory after search models are
 loaded. It keeps search available only when that free memory covers Docling's
 configured headroom plus a small live-query reserve. It does not rely on a
-fixed VRAM size. Set `RAG_SEARCH_DURING_INGESTION=always` only if you want to
-override that safety calculation; `never` restores strictly exclusive indexing.
+fixed VRAM size. If memory drops between that check and Docling startup, auto
+mode closes the reranker worker, unloads the Ollama embedding model, and retries
+the same queue once with search temporarily paused. Set
+`RAG_SEARCH_DURING_INGESTION=always` only if you want to override that safety
+calculation; `never` restores strictly exclusive indexing.
 When concurrent mode is active, search pauses only briefly while a document's
 Chroma records, lexical index, and manifest are committed, so a result never
 mixes old and new revisions of the same source.
+
+A conversion failure is isolated to its PDF. The document is moved to
+quarantine with its error history, and the worker continues with the remaining
+queue. Service-level failures that make every document unsafe to process still
+stop the job and preserve all pending work.
 
 ### Check the installation
 
