@@ -5,314 +5,220 @@
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Reference Desk is a private, local search application for PDF collections. It
-finds relevant passages across all your documents and opens the exact page and
-highlighted source region.
+Reference Desk is a private, local search application for PDF libraries. Ask a
+question, find the strongest passages across your documents, and open the exact
+PDF page and highlighted source region.
 
-It is an evidence-first alternative to answer-generation tools: the retrieval
-pipeline returns ranked source passages and always preserves a direct route to
-the original PDF evidence.
+It is intentionally **evidence-first**. Reference Desk retrieves and ranks
+source passages; it does not generate an answer that could hide where a claim
+came from.
 
-Your PDFs, indexes, bookmarks, and notes stay on your computer. They are not
-uploaded to GitHub.
+Your PDFs, indexes, searches, notes, and quality labels stay on your computer.
 
-## What it can do
+## At a glance
 
-- Search all indexed PDFs at once.
-- Combine semantic and exact-term search, then rerank the best passages.
-- Open citations on the correct PDF page with selectable text.
-- Save passages, notes, bookmarks, and named research collections.
-- Compare passages and export selected material to Markdown or Word.
-- Add, replace, quarantine, restore, and back up documents from the interface.
-- Check corpus health, storage use, duplicates, and document revisions.
-- Compare retrieval configurations in a saved evaluation workbench.
-- Recover from CUDA reranker failures without restarting the whole app.
-- Export a privacy-safe diagnostic ZIP without PDFs, queries, or excerpts.
+- Hybrid semantic and exact-term search across a local PDF collection.
+- Multilingual GTE reranking by default, with BGE available for comparison.
+- Exact citations with page and source-region provenance.
+- Structure-aware ingestion for headings, paragraphs, lists, tables,
+  definitions, requirements, and equations.
+- Saved passages, notes, collections, comparisons, and Markdown/Word export.
+- Managed indexing queue with pause, recovery, quarantine, revisions, and
+  portable backups.
+- Built-in relevance labeling, benchmark management, experiments, regression
+  thresholds, confidence intervals, and latency metrics.
+- Isolated reranker process, automatic GPU-memory coordination, safe software
+  updates, and privacy-safe diagnostic export.
 
-## Computer requirements
+## Quick start on Windows
 
-The recommended computer has:
+No Git or programming experience is required.
 
-- Windows 10 or Windows 11.
-- Python 3.12, 64-bit.
-- Ollama.
-- An NVIDIA CUDA or AMD ROCm-compatible GPU.
-- A current GPU driver.
+### Requirements
 
-CPU mode is available, but document processing and reranking will be much
-slower. Node.js is not required unless you plan to change the interface.
+| Required | Notes |
+| --- | --- |
+| Windows 10 or 11 | 64-bit installation |
+| Python 3.12 | Enable **Add Python to PATH** during installation |
+| Ollama | Runs the Qwen embedding model locally |
+| Current GPU driver | NVIDIA CUDA and supported AMD ROCm devices are detected automatically |
 
-## Easy Windows installation
+A GPU is strongly recommended. CPU mode works, but document ingestion and
+reranking are considerably slower. Six gigabytes of VRAM is usable; 8 GB or
+more gives Docling and the reranker more headroom.
 
-You do not need Git, GitHub CLI, or programming experience for this method.
+Node.js is required only when changing the React interface.
 
-### 1. Install Python and Ollama
+### Install
 
-Install these two applications before continuing:
+1. Install [64-bit Python 3.12](https://www.python.org/downloads/windows/) and
+   [Ollama for Windows](https://ollama.com/download/windows).
+2. Download `reference-desk-windows.zip` from the
+   [latest release](https://github.com/FKENZOLS/reference-desk/releases/latest).
+3. Extract the complete ZIP. Do not run the application from inside it.
+4. Double-click `SETUP.bat` and wait for the success message.
+5. Double-click `START.bat`.
 
-1. [Python for Windows](https://www.python.org/downloads/windows/) — choose a
-   64-bit Python 3.12 release and enable **Add Python to PATH** during setup.
-2. [Ollama for Windows](https://ollama.com/download/windows).
+The first setup creates an isolated Python environment, installs the appropriate
+CUDA, ROCm, or CPU packages, downloads `qwen3-embedding:0.6b`, caches the
+rerankers and tokenizer, and checks the installation. Several gigabytes may be
+downloaded.
 
-Also install the latest driver for your NVIDIA or AMD GPU.
-
-### 2. Download and extract Reference Desk
-
-[Download the latest Windows ZIP](https://github.com/FKENZOLS/reference-desk/archive/refs/heads/main.zip)
-
-Open the downloaded ZIP and select **Extract all**. Do not run the application
-from inside the ZIP.
-
-### 3. Double-click `SETUP.bat`
-
-The setup detects NVIDIA CUDA, AMD ROCm, or CPU mode, creates an isolated
-Python environment, installs the correct packages, downloads Qwen3-Embedding
-through Ollama, caches the public tokenizer and selectable rerankers from
-Hugging Face, and checks the computer. The first installation is several gigabytes and
-can take a while.
-
-The window stays open if anything goes wrong, so the error message can be
-read. Common solutions are also included in `INSTALL_WINDOWS.txt`.
-
-### 4. Double-click `START.bat`
-
-Reference Desk normally opens automatically. If it does not, visit
+Reference Desk normally opens automatically. Otherwise visit
 [http://127.0.0.1:7860](http://127.0.0.1:7860).
 
-Keep the command window open while using the app. Close it, or press `Ctrl+C`,
-to stop Reference Desk. Double-click `START.bat` whenever you want to use it
-again.
+Keep the command window open while using the application. Close it or press
+`Ctrl+C` to stop, then use `START.bat` the next time.
 
-<details>
-<summary>Install with GitHub CLI instead</summary>
+## Your first search
 
-Install [Git for Windows](https://git-scm.com/download/win) and
-[GitHub CLI](https://cli.github.com/), then open PowerShell:
-
-```powershell
-gh auth login --web --git-protocol https
-cd "$HOME\Documents"
-gh repo clone FKENZOLS/reference-desk
-cd reference-desk
-powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend auto
-powershell -ExecutionPolicy Bypass -File .\start.ps1
-```
-
-If automatic detection selects the wrong backend, replace `auto` with `rocm`,
-`cuda`, or `cpu`.
-
-</details>
-
-## Add and search documents
-
-1. Open **Documents** in the left navigation.
-2. Add one or more PDF files.
+1. Open **Documents**.
+2. Add one or more PDFs.
 3. Select **Apply pending changes**.
 4. Wait for indexing to finish.
-5. Return to **Search** and search the whole collection.
+5. Open **Search** and enter a question, phrase, identifier, or section number.
+6. Select **Open source** on a result to inspect the original evidence.
 
-Open **Filters and search within results** to switch between the BGE and
-multilingual GTE rerankers. GTE is loaded and validated by default in an
-isolated GPU worker. The React interface and document list become available
-first; GTE warms in the background so model loading does not hold up the
-browser. PyTorch, Transformers, Chroma, LangChain, and the legacy Gradio UI are
-also excluded from the web-bootstrap import path. The Search page reports GTE
-as background-loading immediately; the default warmup begins after 0.5 seconds.
-The first
-search after switching can take longer
-while the selected model loads. Reference Desk keeps only one reranker loaded
-at a time to avoid multiplying GPU memory use. If CUDA inference crashes, the
-worker restarts while the web application and your open pages stay available.
-The search page reports model loading, worker identity, and device health.
-Enable **Show
-retrieval diagnostics** to inspect dense, lexical, fusion, reranker, token,
-truncation, timing, and adaptive candidate-allocation data for each result.
-The default Search interface stays focused on the passages and source actions.
-Detailed retrieval diagnostics remain available through the filters panel.
+Large technical books take time to index because pages are reconstructed,
+tables are analyzed, passages are embedded, and provenance is preserved. The
+queue continues when one PDF fails; an unrecoverable document is quarantined
+instead of stopping every remaining item.
 
-Open the collapsed **Advanced** section at the bottom of the sidebar to reach
-**Quality**, **Experiments**, and **Software updates**. Experiments can import a JSONL benchmark or use complete cases built
-from relevance feedback. You can compare GTE and BGE on the same candidate
-pool, vary candidate count, reranker weight, and passage mode, then save the
-results. Selecting **Use in production** applies that completed experiment's
-reranker, candidate count, blend weight, and passage mode to normal searches.
-Two-model comparison runs are intentionally not promotable; run the winning
-model once by itself to create an unambiguous production configuration.
-Imported benchmarks support calibration/test splits, categories, languages,
-multiple acceptable passages, and hard negatives. Results include 95%
-confidence intervals and subgroup metrics. A saved baseline can block
-promotion when nDCG@5 falls by more than the configured regression threshold.
-Baselines must contain every selected reranker and the exact same benchmark
-version and split.
+### Main areas
 
-Large or scanned documents can take longer. The ingestion queue can be paused
-between documents, and a failed PDF is moved to quarantine instead of stopping
-the rest of the queue. Each PDF now has one explicit lifecycle—uploaded,
-pending, processing, indexed, failed, or quarantined—with its indexed hash and
-transition history visible from the Documents table.
+| Area | Purpose |
+| --- | --- |
+| **Search** | Query the collection, filter scope, switch rerankers, inspect citations, and label relevance |
+| **Documents** | Upload, replace, reindex, restore, quarantine, back up, and inspect corpus health |
+| **Workspace** | Organize saved passages, notes, and research collections |
+| **Advanced → Quality** | Review labels and calibrate the relevance gate |
+| **Advanced → Experiments** | Compare retrieval configurations on versioned benchmarks |
+| **Advanced → Software updates** | Check and safely fast-forward a Git installation |
 
-Ingestion uses quality-preserving adaptive performance settings. It begins with
-12-page conversion windows and recursively retries allocation failures with the
-same accurate parser on smaller ranges. Docling model batches remain at 2 on
-GPUs below 8 GB, rise to 3 or 4 only on larger accelerators, and preprocessing
-uses at most four CPU threads. The exact title-aware Qwen document prompt is
-cached with the embedding-model digest, so later metadata or chunking reindexes
-can reuse unchanged vectors without accepting stale embeddings. Every completed
-document prints conversion, chunking, postprocessing, embedding, indexing, total
-time, pages per second, and embedding-cache hits.
+GTE loads in the background after startup. The application keeps only the
+selected reranker active, limiting GPU-memory use. The first search after
+switching rerankers can therefore take longer.
 
-The automatic values can be overridden with `RAG_PDF_PAGE_WINDOW`,
-`RAG_DOCLING_PAGE_BATCH_SIZE`, `RAG_DOCLING_MODEL_BATCH_SIZE`, and
-`RAG_DOCLING_NUM_THREADS`. Set `RAG_EMBEDDING_CACHE=0` only when diagnosing the
-cache; disabling it does not change retrieval quality, but makes reindexing
-slower.
+## Everyday operations
 
-The bell in the lower-right corner keeps persistent updates for model loading,
-indexing, worker restarts, backups, and experiments. **Export diagnostics** on
-the Documents page creates a support ZIP containing only sanitized settings,
-package/GPU information, aggregate corpus health, migration state, and generic
-errors. It excludes document names and paths, PDFs, excerpts, queries, and
-feedback text.
+### Back up or move a library
 
-## Update to the latest version
+1. Open **Documents** and select **Create backup**.
+2. Install Reference Desk on the destination computer.
+3. Open **Documents** there and restore the backup.
 
-If you installed the ZIP, download it again, extract it over the existing
-`reference-desk` folder, and allow Windows to replace files with matching
-names. The package contains no PDFs or research databases, so your local data
-is left in place. Run `SETUP.bat` again after a major update.
+The backup includes the managed documents, indexes, queue state, revisions,
+quarantine, and research workspace. GitHub contains only application source.
 
-This release changes retrieval chunks to preserve table column headers,
-section ancestry, and paragraph/list/definition/requirement/equation types.
-After upgrading, open **Documents** and choose **Reindex all** once so existing
-PDFs receive the new structural metadata. Local state migrations create a
-small `pre-v*-migration.bak` snapshot before changing an older schema.
+### Update the application
 
-If you installed with Git, open **Advanced → Software updates**. The page checks
-the configured tracking branch on GitHub and can install a clean fast-forward
-update. It refuses to overwrite tracked source edits or merge diverged history.
-When Reference Desk was opened with `START.bat` or `start.ps1`, it restarts
-automatically and refreshes dependencies only when their configuration changed.
-PDFs, indexes, backups, settings, benchmarks, and workspace data are ignored by
-Git and remain in place.
+For a Git-based installation, open **Advanced → Software updates**. The updater:
 
-The equivalent manual update is:
+- fetches the configured GitHub tracking branch;
+- accepts only a clean, fast-forward update;
+- refuses to overwrite local source changes or merge diverged history;
+- preserves all ignored library and workspace data; and
+- restarts automatically when the app was opened through `START.bat` or
+  `start.ps1`.
 
-```powershell
-git fetch --prune
-git merge --ff-only '@{upstream}'
-powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend auto
-```
+For a ZIP installation, download the latest release again, extract it over the
+application folder, run `SETUP.bat`, and start normally. Local data directories
+are not part of the release archive.
 
-The setup command reuses packages that are already installed. Start the app
-again with `powershell -ExecutionPolicy Bypass -File .\start.ps1`.
+### Privacy and diagnostics
 
-## Move your library to another computer
+The following remain local and are excluded from source releases:
 
-GitHub contains only the application. Your PDFs and research data are separate.
+- PDFs and generated indexes;
+- notes, bookmarks, collections, history, and relevance labels;
+- quarantine, revisions, logs, and backups; and
+- generated evaluation results.
 
-1. In the old installation, open **Documents** and select **Create backup**.
-2. Install Reference Desk on the new computer using the instructions above.
-3. Open **Documents** on the new computer and restore the backup.
+**Export diagnostics** creates a sanitized support ZIP containing versions,
+hardware information, aggregate health, migration state, queue state, and
+generic errors. It excludes document names, document paths, PDF content,
+passage excerpts, queries, and feedback text.
 
 ## Troubleshooting
 
-### `python` is not recognized
+### The application does not start
 
-Install 64-bit Python 3.12 again, enable **Add Python to PATH**, and reopen
-PowerShell.
-
-### `gh` or `git` is not recognized
-
-Install Git and GitHub CLI, then close and reopen PowerShell. Confirm the setup
-with:
-
-```powershell
-git --version
-gh --version
-```
-
-### PowerShell says script execution is disabled
-
-Use the full commands shown in this README. They run the scripts with
-`-ExecutionPolicy Bypass` only for that process and do not permanently change
-your Windows policy.
-
-### Ollama is unavailable or Qwen3-Embedding is missing
-
-Start the Ollama application, then run:
-
-```powershell
-ollama pull qwen3-embedding:0.6b
-```
-
-### AMD ROCm setup fails
-
-Update the AMD driver and confirm that the GPU is supported by AMD's current
-PyTorch-on-Windows release. Ollama supporting a GPU through Vulkan does not
-automatically mean that PyTorch supports the same GPU through ROCm. CPU mode is
-available as a fallback.
-
-### The app reports insufficient GPU memory
-
-Close other GPU-heavy applications and retry. The document manager measures
-free VRAM and automatically releases search models before ingestion when both
-workloads do not fit at that moment.
-
-### Search pauses while documents are indexing
-
-By default, Reference Desk measures free GPU memory after search models are
-loaded. It keeps search available only when that free memory covers Docling's
-configured headroom plus a small live-query reserve. It does not rely on a
-fixed VRAM size. If memory drops between that check and Docling startup, auto
-mode closes the reranker worker, unloads the Ollama embedding model, and retries
-the same queue once with search temporarily paused. Set
-`RAG_SEARCH_DURING_INGESTION=always` only if you want to override that safety
-calculation; `never` restores strictly exclusive indexing.
-When concurrent mode is active, search pauses only briefly while a document's
-Chroma records, lexical index, and manifest are committed, so a result never
-mixes old and new revisions of the same source.
-
-A conversion failure is isolated to its PDF. The document is moved to
-quarantine with its error history, and the worker continues with the remaining
-queue. Service-level failures that make every document unsafe to process still
-stop the job and preserve all pending work.
-
-### Check the installation
+Run the built-in compatibility check from PowerShell:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py doctor
 ```
 
-## Privacy and backups
+If Python is not recognized, reinstall 64-bit Python 3.12 with **Add Python to
+PATH** enabled. If PowerShell blocks a script, use the commands in this README;
+they apply `-ExecutionPolicy Bypass` only to that process.
 
-The following data stays local and is excluded from GitHub:
+### Ollama or Qwen3-Embedding is unavailable
 
-- Source PDFs.
-- Chroma and lexical indexes.
-- Notes, bookmarks, search history, and quality labels.
-- Quarantine, revisions, logs, and corpus backups.
+Start Ollama and run:
 
-Use **Create backup** in the Documents page to move or protect this data.
-
-<details>
-<summary>Linux installation</summary>
-
-Install Python 3.12, Git, Ollama, and the correct NVIDIA or AMD driver. Then run:
-
-```bash
-gh auth login --web --git-protocol https
-gh repo clone FKENZOLS/reference-desk
-cd reference-desk
-bash scripts/setup.sh auto
-bash start.sh
+```powershell
+ollama pull qwen3-embedding:0.6b
 ```
 
-</details>
+### GPU memory is insufficient
 
-## Advanced: architecture and retrieval quality
+Close games, browsers using GPU acceleration, and other local AI tools. In
+automatic mode, Reference Desk releases the reranker and retained Ollama model
+when Docling needs exclusive GPU access, then continues the queue.
 
-Reference Desk uses retrieval rather than answer generation. It returns source
-passages and keeps a direct route back to the PDF evidence.
+Search remains available during ingestion only when current free VRAM covers
+both Docling headroom and a live-query reserve. Chroma, lexical, and manifest
+updates are committed together, so search never observes mixed revisions of a
+document.
+
+### AMD acceleration is unavailable
+
+Update the AMD driver and verify support for the current PyTorch-on-Windows
+ROCm distribution. Ollama may use an AMD GPU through Vulkan even when PyTorch
+cannot use that device through ROCm. CPU mode remains available.
+
+### A page reports `std::bad_alloc`
+
+The adaptive converter retries allocation failures with the same accurate
+parser on progressively smaller ranges. If one page still cannot be converted,
+PDFium is attempted. A page is never silently omitted: the document is either
+completed or marked failed and quarantined, while the rest of the queue
+continues.
+
+---
+
+## Technical case study
+
+This section describes the project as an engineering and research artifact.
+For module-level maintenance rules and invariants, see
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+### Problem statement
+
+Technical-document search has three competing requirements:
+
+1. **Semantic recall:** users rarely phrase a question exactly as the source.
+2. **Lexical precision:** identifiers, equations, section numbers, and exact
+   terminology must not be blurred by semantic similarity.
+3. **Verifiability:** a useful result must lead back to the original page and
+   source region.
+
+A single vector-search score does not satisfy all three. Reference Desk uses a
+staged retrieval architecture that keeps each responsibility explicit and
+measurable.
+
+### Design goals and non-goals
+
+The primary goals are local privacy, evidence provenance, multilingual
+retrieval, reproducible model configuration, recoverable long-running jobs,
+and measurable quality.
+
+Reference Desk is not currently a generative question-answering system, a
+cloud document service, or a multi-user collaboration platform. It ranks
+evidence and lets the user interpret it.
+
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -325,14 +231,14 @@ flowchart LR
     end
 
     subgraph SEARCH["Search and ranking"]
-        Q["User query"] --> G["Dense retrieval<br/>40 candidates"]
-        Q --> H["Lexical retrieval<br/>40 candidates"]
+        Q["User query"] --> G["Dense retrieval<br/>adaptive candidate pool"]
+        Q --> H["Lexical retrieval<br/>adaptive candidate pool"]
         E --> G
         F --> H
         G --> I["Reciprocal-rank fusion"]
         H --> I
-        I --> J["BGE or multilingual GTE<br/>cross-encoder score for 20 candidates"]
-        J --> K["Diversity and evidence gate<br/>normally show 5 results"]
+        I --> J["GTE or BGE cross-encoder<br/>shortlisted candidates"]
+        J --> K["Diversity and calibrated evidence gate"]
     end
 
     K --> L["Parent passage + exact citation"]
@@ -341,139 +247,299 @@ flowchart LR
     N --> O["Recall, MRR, nDCG, rejection, and latency evaluation"]
 ```
 
-### Parent–child retrieval
+### Ingestion pipeline
 
-Docling first reconstructs document structure: headings, paragraphs, lists,
-tables, reading order, page numbers, and source coordinates. The chunker then
-creates two related representations:
+Docling reconstructs page layout, reading order, headings, paragraphs, lists,
+tables, formulas, and coordinates. Reference Desk then creates two linked
+representations:
 
-- A **parent chunk** keeps the section context and is what the user reads.
-- Smaller overlapping **child passages** are embedded and searched.
+- A **structural parent** retains headings and readable surrounding context.
+- Overlapping **retrieval children** provide smaller targets for embedding and
+  lexical matching.
 
-Small children make precise matches easier, while the parent prevents an
-isolated sentence from losing its heading or surrounding explanation. Every
-child stores its parent identity and provenance, so a match can expand back to
-the readable passage and exact PDF region.
+Table children repeat their column headers so a retrieved row remains
+interpretable. Every child stores its parent identifier, source path, page
+range, section ancestry, content type, file hash, ingestion fingerprint, and
+available bounding-box provenance.
 
-Document names use the first credible title detected on physical page 1. The
-resolver prefers an explicit Docling title, then a page-1 heading, then the
-first meaningful page-1 text line. It never promotes a heading from page 2 or
-later to the title of the whole book; image-only covers fall back to the PDF
-filename. After upgrading an existing collection, select **Reindex all** once
-to rewrite previously stored titles.
+Document titles come only from physical page 1: an explicit title, a page-one
+heading, or the first credible visible line. Later chapter headings cannot
+become the book title; image-only covers fall back to the filename.
 
-### Hybrid retrieval and reciprocal-rank fusion
+#### Quality-preserving performance
 
-Each query runs through two independent retrieval lanes:
+The default converter begins with 12-page windows. Allocation failures split
+the same primary parser range recursively before changing backends. Model batch
+size is selected conservatively from accelerator memory: 2 below 8 GB, 3 from
+8–12 GB, and 4 above 12 GB. CPU preprocessing uses at most four threads.
 
-1. **Dense retrieval** sends an instructed search query to
-   `qwen3-embedding:0.6b` through Ollama and compares its 1024-dimensional
-   vector with child vectors in Chroma. Documents are embedded without a task
-   instruction, as recommended for Qwen's asymmetric retrieval format. This
-   lane handles paraphrases and related meaning.
-2. **Lexical retrieval** uses SQLite FTS5 for exact words, phrases, acronyms,
-   identifiers, and numbers.
+Document embeddings are cached as float32 vectors using a key derived from the
+exact title-aware prompt and immutable embedding fingerprint. A changed title,
+prompt, model digest, or embedding dimension produces a cache miss. The cache
+therefore accelerates later reindexing without accepting stale vectors.
 
-The two score types are not directly comparable. Reciprocal-rank fusion (RRF)
-therefore combines their positions instead of their raw scores:
+Completed documents report conversion, chunking, postprocessing, embedding,
+indexing, total time, pages per second, and cache reuse.
 
-`RRF(document) = sum of 1 / (60 + rank in each result list)`
+### Search pipeline
 
-A passage found by both lanes rises naturally, while a strong result from only
-one lane can still survive. By default, each lane retrieves 40 candidates and
-the fused list keeps 20 for reranking.
+#### 1. Dense retrieval
 
-### Cross-encoder reranking and result diversity
+`qwen3-embedding:0.6b` runs locally through Ollama. Queries receive a technical
+retrieval instruction; documents receive title-aware document formatting. The
+asymmetric prompts and 1024-dimensional model identity are part of the index
+fingerprint.
 
-The selectable BGE and multilingual GTE rerankers read the query and each
-shortlisted passage together and produce a relevance logit and probability.
-This joint judgment is more expensive than vector similarity, so it runs only
-after hybrid retrieval has reduced the corpus to 20 candidates. GTE is the
-smaller option and uses its official custom Transformers implementation.
+#### 2. Lexical retrieval
 
-The final selector normally shows five results. It limits repeated passages
-from the same page or section, then optionally applies a relevance threshold
-learned from explicit user labels. The threshold remains inactive until there
-are enough relevant and incorrect examples to calibrate it safely.
+SQLite FTS5 provides exact matching for names, phrases, acronyms, identifiers,
+dates, numbers, and section references. Deterministic query analysis adjusts
+dense and lexical allocation for signals such as quotes, codes, mathematical
+symbols, query length, and language.
 
-Reranker calibration is keyed to the complete model and prompt fingerprint.
-Changing between BGE and GTE therefore starts a separate score calibration;
-old thresholds and judgments cannot silently affect the new model. Select the
-model on the **Reference quality** page to inspect or calibrate it independently.
+#### 3. Reciprocal-rank fusion
 
-### Model migration and index identity
+Dense and lexical scores have incompatible scales. Reciprocal-rank fusion uses
+positions instead:
 
-The Qwen embedding stack uses the new default collection
-`technical_docs_qwen_v1`. Its model digest, 1024 dimensions, query instruction,
-document format, and tokenizer are included in the ingestion fingerprint. If
-any of them changes, Reference Desk refuses to search an incompatible index.
-After upgrading from an EmbeddingGemma release, open **Documents** and choose
-**Reindex all** once. The legacy Chroma collection is not overwritten, which
-makes rollback possible but may temporarily use additional disk space.
+```text
+RRF(item) = Σ 1 / (60 + rank in each retrieval lane)
+```
 
-### What the quality metrics mean
+A passage found by both lanes rises naturally, while a uniquely strong result
+from one lane can still survive.
 
-- **Recall** asks whether a known relevant passage appears anywhere in the
-  first `k` results. It reveals whether retrieval found the evidence at all.
-- **MRR (Mean Reciprocal Rank)** looks only at the first relevant result. A
-  first-place hit scores `1`, second place scores `1/2`, fifth place scores
-  `1/5`, and the scores are averaged across queries. Higher MRR means useful
-  evidence appears sooner.
-- **nDCG** rewards placing all relevant results near the top and can give
-  more credit to more-relevant passages. Its logarithmic discount makes a
-  relevant result at rank 2 worth more than the same result at rank 10.
-- **Rejection accuracy** checks whether the system correctly reports that no
-  strong evidence was found for an unanswerable query.
-- **Stage recall and latency** show where quality or speed was lost: dense
-  retrieval, lexical retrieval, fusion, reranking, or final filtering.
+#### 4. Cross-encoder reranking
 
-The benchmark format stores expected source pages and passages. User feedback
-can be exported into the same format, allowing changes to chunking, candidate
-counts, fusion, or reranking to be compared against real reference tasks.
-`relevant_targets` groups alternative identifiers such as a chunk ID and its
-source page into one acceptable passage, so reindexing does not count the same
-answer twice.
+The selected reranker reads the query and passage together:
 
-GTE requires the model publisher's custom Python architecture. Release defaults
-pin the GTE weights, that remote-code repository, and BGE weights to reviewed
-immutable Hugging Face commits. Operators may deliberately test other commits
-with model-specific variables such as `RAG_GTE_RERANKER_REVISION` and
-`RAG_GTE_RERANKER_CODE_REVISION`; do not set either variable to a moving branch
-such as `main` on production machines. The legacy unsuffixed variables apply
-only to the startup-selected reranker.
+| Reranker | Role |
+| --- | --- |
+| `Alibaba-NLP/gte-multilingual-reranker-base` | Default compact multilingual reranker |
+| `BAAI/bge-reranker-v2-m3` | Alternative multilingual comparison model |
 
-<details>
-<summary>Developer commands</summary>
+Only the fused shortlist is reranked because cross-encoder inference is more
+expensive than vector similarity. Reranking runs in an isolated process; a CUDA
+failure can restart the worker without taking down the FastAPI application.
+
+GTE uses its publisher's custom Transformers architecture. Both weights and
+the reviewed remote-code repository are pinned to immutable Hugging Face
+commits so an upstream branch cannot silently change executable model code.
+
+#### 5. Selection and evidence gating
+
+The final selector limits near-duplicates and excessive results from one page
+or section. An optional relevance threshold remains inactive until enough
+positive and negative labels exist to calibrate it. Calibration is keyed to the
+complete reranker fingerprint, preventing BGE judgments from silently changing
+GTE behavior.
+
+### Reliability and state management
+
+Documents follow one explicit lifecycle:
+
+```text
+uploaded → pending → processing → indexed
+                       ↓
+                 failed → quarantined
+```
+
+The managed queue stores transition history and the indexed file hash. Index
+changes are prepared before the active source revision is touched. Dense
+vectors, lexical records, and the manifest switch inside one application-
+controlled commit window.
+
+Other reliability measures include:
+
+- automatic GPU headroom checks and exclusive-ingestion fallback;
+- per-document failure isolation;
+- recursive page recovery and PDFium fallback;
+- isolated reranker worker health and restart state;
+- versioned SQLite and manifest migrations with pre-migration backups;
+- validated corpus backup and restore; and
+- fast-forward-only application updates protected by a confirmation token.
+
+### Evaluation workbench
+
+The quality pipeline supports imported JSONL benchmarks and cases assembled
+from explicit user feedback. Benchmarks can contain:
+
+- calibration and held-out test splits;
+- categories and languages;
+- multiple acceptable passages;
+- expected pages and sources;
+- hard negatives and unanswerable questions; and
+- immutable benchmark versions.
+
+Experiments compare candidate counts, reranker weight, passage mode, and BGE
+versus GTE. Results include 95% confidence intervals, subgroup metrics, latency,
+and regression thresholds. A completed single-model experiment can become the
+production configuration; ambiguous two-model comparisons cannot.
+
+#### Metrics
+
+- **Recall@k:** whether acceptable evidence survived retrieval.
+- **MRR:** how early the first acceptable result appears.
+- **nDCG:** whether all graded relevant results are ordered near the top.
+- **Rejection accuracy:** whether unanswerable queries are rejected correctly.
+- **Stage recall:** where evidence was lost—retrieval, fusion, reranking, or
+  final selection.
+- **Latency:** the cost of dense search, lexical search, reranking, and model
+  loading.
+
+The project does not claim universal quality from one benchmark. Production
+defaults should be chosen on representative, versioned, held-out queries from
+the intended document domain.
+
+### Technology stack
+
+| Layer | Technology |
+| --- | --- |
+| Web application | FastAPI, Uvicorn, React, TypeScript, Vite |
+| PDF understanding | Docling, PDFium |
+| Embeddings | Qwen3-Embedding 0.6B through Ollama |
+| Dense index | Chroma |
+| Lexical index | SQLite FTS5 |
+| Reranking | Transformers, PyTorch, GTE/BGE cross-encoders |
+| Workspace and evaluation | Versioned SQLite |
+| Testing and automation | pytest, GitHub Actions |
+
+### Repository map
+
+| Path | Responsibility |
+| --- | --- |
+| `main.py` | Stable command-line entry point |
+| `search_app.py` | FastAPI routes, runtime lifecycle, retrieval, ranking, citations, and viewer |
+| `ingest.py` | Docling conversion, chunking, embedding, and atomic index updates |
+| `embedding_cache.py` | Prompt- and revision-safe document-vector cache |
+| `rag_common.py` | Shared paths, embedding prompts, fingerprints, and Ollama client |
+| `reranker_worker.py` | Isolated model process and recovery protocol |
+| `document_manager.py` | Safe managed PDF operations and document state |
+| `corpus_scale.py` | Queue, health, quarantine, revisions, and backups |
+| `lexical_index.py` | FTS5 persistence and lexical retrieval |
+| `workspace_store.py` | Notes, feedback, benchmarks, experiments, notifications, and migrations |
+| `frontend/src` | React application source |
+| `frontend/dist` | Checked-in production frontend served by FastAPI |
+| `tests` | Unit, API, migration, retrieval, ingestion, and safety regression tests |
+
+## Limitations
+
+- First-time ingestion remains compute-intensive, especially for books with
+  dense tables, complex layouts, or OCR requirements.
+- Citation quality is bounded by PDF text, layout, and coordinate extraction.
+- The page-one title resolver is deliberately conservative and may use the
+  filename for image-only covers.
+- GTE and BGE scores are model-specific and must be calibrated independently.
+- A 6 GB GPU requires conservative batching and may temporarily pause search
+  during ingestion.
+- The built-in updater applies only to Git checkouts; ZIP installations update
+  by replacing application files from a release.
+- There is no generated answer, cloud synchronization, or multi-user access
+  control.
+
+## Future research
+
+The existing evaluation infrastructure makes the following questions testable:
+
+1. **Adaptive retrieval allocation:** how much latency can query-dependent
+   dense, lexical, and rerank budgets save at equal recall?
+2. **Hierarchy-aware ranking:** when should section ancestry influence fusion
+   versus only contextualize the reranker input?
+3. **Table retrieval:** do row/column-aware representations outperform repeated
+   Markdown headers across different technical domains?
+4. **Multilingual transfer:** how stable are calibration thresholds across
+   languages, translated queries, and mixed-language corpora?
+5. **Uncertainty and rejection:** can calibrated probabilities or conformal
+   methods improve no-answer decisions without reducing answerable-query recall?
+6. **Feedback quality:** which labeling interface produces the most reliable
+   benchmark cases with the least user effort?
+7. **Efficiency:** what are the latency, memory, energy, and quality tradeoffs
+   among rerank candidate count, precision, quantization, and caching?
+8. **Robust evaluation:** how sensitive are conclusions to benchmark version,
+   query category, document collection, and confidence-interval method?
+
+Future experiments should preserve immutable configurations, held-out test
+splits, per-category reporting, and regression thresholds. That keeps research
+results comparable instead of optimizing repeatedly against one visible score.
+
+## Developer guide
+
+### Clone and set up
+
+```powershell
+git clone https://github.com/FKENZOLS/reference-desk.git
+cd reference-desk
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Backend auto
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+Use `cuda`, `rocm`, or `cpu` instead of `auto` when selecting a backend
+explicitly.
+
+Linux setup is available through `bash scripts/setup.sh auto`.
+
+### Commands
 
 ```powershell
 python main.py serve
 python main.py ingest
 python main.py evaluate examples/benchmark.example.jsonl
 python main.py evaluate examples/benchmark.example.jsonl --reranker both
-python main.py evaluate examples/benchmark.example.jsonl --reranker gte --candidate-count 40 --rerank-weight 0.75
-python main.py evaluate examples/benchmark.example.jsonl --reranker gte --passage-mode metadata-child-parent
 python main.py doctor
 python main.py export
 python main.py test
+
 cd frontend
+npm ci
 npm run typecheck
 npm run build
 ```
 
-`--reranker both` retrieves each benchmark query once and applies BGE and GTE
-to cloned identical candidate pools. Evaluation reports fusion recall at 10,
-20, 40, and 80 in addition to selected recall, MRR, nDCG, truncation, and
-latency. Use a representative held-out benchmark before changing production
-candidate counts or blend weights. `--passage-mode` compares child text,
-metadata plus child text, parent context, or combined child and parent context
-without changing the production input format.
+`--reranker both` retrieves one candidate pool per benchmark query and reranks
+cloned copies with GTE and BGE, preserving a fair comparison. Use
+`--candidate-count`, `--rerank-weight`, and `--passage-mode` for controlled
+experiments.
 
-The production React bundle is included in `frontend/dist`. Node.js 20 or newer
-is needed only when modifying `frontend/src`. Read
-[ARCHITECTURE.md](ARCHITECTURE.md) before reorganizing ingestion, retrieval,
-citations, or storage.
+### Selected configuration overrides
 
-</details>
+Defaults are intended to be safe. Change them only with a benchmark or a clear
+operational reason.
+
+| Variable | Purpose |
+| --- | --- |
+| `RAG_ACCELERATOR` | Select `auto`, `cuda`, `rocm`, or `cpu` |
+| `RAG_RERANKER_CHOICE` | Select `gte` or `bge` |
+| `RAG_SEARCH_DURING_INGESTION` | Select `auto`, `never`, or `always` |
+| `RAG_PDF_PAGE_WINDOW` | Initial adaptive Docling page window |
+| `RAG_DOCLING_PAGE_BATCH_SIZE` | Docling page preprocessing batch |
+| `RAG_DOCLING_MODEL_BATCH_SIZE` | Layout, OCR, and table model batch |
+| `RAG_DOCLING_NUM_THREADS` | Native preprocessing thread count |
+| `RAG_EMBEDDING_CACHE` | Set to `0` to disable document-vector reuse |
+| `RAG_DEBUG_RETRIEVAL` | Enable detailed retrieval diagnostics by default |
+| `RAG_SERVER_HOST`, `RAG_SERVER_PORT` | Change the local server binding |
+
+Changing an embedding model, prompt, dimension, tokenizer, or structural chunk
+configuration changes the index identity and requires a compatible collection
+or reindex. Reranker thresholds and experiment results remain tied to their
+model fingerprints.
+
+### Tests and release safety
+
+GitHub Actions installs the CPU dependency profile, runs the complete pytest
+suite, installs the frontend from its lock file, typechecks TypeScript, and
+builds the production bundle.
+
+The release exporter uses Git's file list and fails closed around PDF, database,
+log, index, backup, and workspace paths:
+
+```powershell
+python scripts/export_release.py --check
+python main.py export
+```
+
+Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing storage boundaries,
+document lifecycle, ingestion commit behavior, citation provenance, or runtime
+ownership.
 
 ## License
 
