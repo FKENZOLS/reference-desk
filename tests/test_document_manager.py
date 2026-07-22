@@ -366,6 +366,25 @@ def test_index_commit_pauses_search_until_the_child_finishes(tmp_path, monkeypat
     search_app._SEARCH_MAINTENANCE_LOCK.release()
 
 
+def test_structured_ingestion_progress_updates_the_visible_job(monkeypatch) -> None:
+    monkeypatch.setattr(
+        search_app,
+        "_DOCUMENT_JOB",
+        {"running": True, "message": "Starting", "log": []},
+    )
+
+    handled = search_app._handle_corpus_event(
+        'CORPUS_EVENT {"event":"progress","source_id":"manual.pdf",'
+        '"phase":"conversion","message":"Converting pages 13-18 of 100"}\n'
+    )
+
+    assert handled is True
+    assert (
+        search_app.document_job_snapshot()["message"]
+        == "Converting pages 13-18 of 100"
+    )
+
+
 def test_successful_background_job_clears_pending_changes(monkeypatch) -> None:
     cleared = []
     fake_repository = SimpleNamespace(clear_pending=lambda: cleared.append(True))
@@ -448,6 +467,8 @@ def test_auto_indexing_retries_exclusively_when_gpu_headroom_changes(
     search_app._run_document_index_job(False, search_available=True)
 
     assert len(launches) == 2
+    assert launches[0][0][1] == "-u"
+    assert launches[0][1]["PYTHONUNBUFFERED"] == "1"
     assert "--commit-gate" in launches[0][0]
     assert "--commit-gate" not in launches[1][0]
     assert launches[0][1]["RAG_GPU_HEADROOM_WARNING_MB"] == "4268"

@@ -3,20 +3,26 @@ import threading
 import time
 
 from ingest import (
+    AdaptivePageWindow,
     ChunkRecord,
     EmbeddingCacheStats,
+    MachineResources,
     convert_page_range_resilient,
     docling_safe_pdf_path,
     embed_documents_in_batches,
     ids_fingerprint,
     infer_document_title,
     infer_retrieval_unit_type,
+    ingestion_fingerprint,
     index_commit_window,
     is_cuda_out_of_memory,
     merge_short_chunks,
+    missing_extractable_pages,
     recommended_docling_batch_size,
     recommended_docling_threads,
+    recommended_page_window,
     report_cuda_headroom,
+    resolve_ingestion_tuning,
     split_text_for_retrieval,
     split_structural_record,
     source_is_current,
@@ -232,6 +238,7 @@ def test_failed_page_window_is_split_until_it_succeeds(tmp_path) -> None:
 
 def test_allocation_failure_splits_before_parser_fallback(tmp_path) -> None:
     calls = []
+    memory_pressure = []
 
     class PrimaryConverter:
         def convert(self, path, page_range, raises_on_error):
@@ -259,22 +266,97 @@ def test_allocation_failure_splits_before_parser_fallback(tmp_path) -> None:
         1,
         6,
         fallback_converter=UnexpectedFallback(),
+        on_memory_pressure=memory_pressure.append,
     )
 
     assert calls[0] == (1, 6)
+    assert memory_pressure
+    assert memory_pressure[0] == 6
     assert sorted(page for result in results for page in result.document.pages) == list(
         range(1, 7)
     )
 
 
 def test_docling_tuning_is_conservative_and_hardware_aware() -> None:
-    assert recommended_docling_batch_size(None) == 2
-    assert recommended_docling_batch_size(6_144) == 2
-    assert recommended_docling_batch_size(8_192) == 3
-    assert recommended_docling_batch_size(12_288) == 4
-    assert recommended_docling_threads(2) == 2
-    assert recommended_docling_threads(8) == 4
-    assert recommended_docling_threads(64) == 4
+    six_gb_machine = MachineResources(
+        cpu_count=16,
+        system_available_mb=15_315,
+        system_total_mb=32_654,
+        accelerator_available_mb=5_134,
+        accelerator_total_mb=6_143,
+    )
+    tuning = resolve_ingestion_tuning(six_gb_machine)
+    assert tuning.page_window == 6
+    assert tuning.page_batch_size == 2
+    assert tuning.model_batch_size == 2
+    assert tuning.queue_max_size == 12
+    assert tuning.num_threads == 4
+
+    assert recommended_docling_batch_size(None) == 1
+    assert recommended_docling_batch_size(3_757, 14_000) == 1
+    assert recommended_docling_batch_size(5_134, 14_000) == 2
+    assert recommended_docling_batch_size(14_000, 32_000) == 4
+    assert recommended_page_window(5_134, 15_315) == 6
+    assert recommended_page_window(14_000, 32_000) == 16
+    assert recommended_docling_threads(2, 16_000) == 1
+    assert recommended_docling_threads(8, 4_096) == 1
+    assert recommended_docling_threads(64, 16_000) == 4
+
+
+def test_explicit_ingestion_tuning_overrides_automatic_values(monkeypatch) -> None:
+    resources = MachineResources(16, 32_000, 64_000, 14_000, 24_000)
+    monkeypatch.setattr(ingest, "PDF_PAGE_WINDOW", 7)
+    monkeypatch.setattr(ingest, "DOCLING_PAGE_BATCH_SIZE", 2)
+    monkeypatch.setattr(ingest, "DOCLING_MODEL_BATCH_SIZE", 3)
+    monkeypatch.setattr(ingest, "DOCLING_QUEUE_MAX_SIZE", 9)
+    monkeypatch.setattr(ingest, "DOCLING_NUM_THREADS", 2)
+
+    tuning = resolve_ingestion_tuning(resources)
+
+    assert (
+        tuning.page_window,
+        tuning.page_batch_size,
+        tuning.model_batch_size,
+        tuning.queue_max_size,
+        tuning.num_threads,
+    ) == (7, 2, 3, 9, 2)
+
+
+def test_machine_performance_tuning_is_not_part_of_semantic_fingerprint(
+    monkeypatch,
+) -> None:
+    original = ingestion_fingerprint("tokenizer", "auto")
+    monkeypatch.setattr(ingest, "PDF_PAGE_WINDOW", 2)
+    monkeypatch.setattr(ingest, "DOCLING_PAGE_BATCH_SIZE", 1)
+    monkeypatch.setattr(ingest, "DOCLING_MODEL_BATCH_SIZE", 1)
+    monkeypatch.setattr(ingest, "DOCLING_QUEUE_MAX_SIZE", 4)
+    monkeypatch.setattr(ingest, "DOCLING_NUM_THREADS", 1)
+
+    assert ingestion_fingerprint("tokenizer", "auto") == original
+
+
+def test_page_window_stays_reduced_after_memory_pressure() -> None:
+    window = AdaptivePageWindow(10)
+    window.observe_memory_pressure(10)
+    assert window.current == 5
+    window.observe_memory_pressure(3)
+    assert window.current == 5
+    window.observe_memory_pressure(5)
+    assert window.current == 2
+
+
+def test_only_unrepresented_source_pages_with_text_require_recovery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    records = [title_record("represented", page=2)]
+    monkeypatch.setattr(
+        ingest,
+        "extractable_text_pages",
+        lambda pdf_path, page_numbers: {1, 2, 4} & set(page_numbers),
+    )
+
+    assert missing_extractable_pages(tmp_path / "manual.pdf", records, 4) == [1, 4]
 
 
 def test_embedding_cache_reuses_exact_title_aware_prompt(tmp_path, monkeypatch) -> None:
@@ -487,7 +569,7 @@ def test_failed_pdf_does_not_stop_remaining_queue(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(ingest, "EXPORT_DEBUG_FILES", False)
     monkeypatch.setattr(ingest, "parse_args", lambda: args)
     monkeypatch.setattr(ingest, "resolved_embedding_revision", lambda: "test-revision")
-    monkeypatch.setattr(ingest, "report_cuda_headroom", lambda: None)
+    monkeypatch.setattr(ingest, "report_cuda_headroom", lambda *_: None)
     monkeypatch.setattr(ingest, "create_collection", lambda: object())
     monkeypatch.setattr(ingest, "load_manifest", lambda: {})
     monkeypatch.setattr(ingest, "create_converter", lambda **kwargs: object())

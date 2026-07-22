@@ -16,6 +16,7 @@ query prefixes must remain consistent between ingestion and search.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import hashlib
 import json
@@ -32,7 +33,7 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from secrets import token_urlsafe
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import chromadb
 import pypdfium2 as pdfium
@@ -114,53 +115,202 @@ RETRIEVAL_CHILD_OVERLAP_TOKENS = int(
     os.environ.get("RAG_RETRIEVAL_CHILD_OVERLAP_TOKENS", "40")
 )
 
-# Large PDFs start with a wider window to reduce converter-call overhead. The
-# resilient converter halves allocation failures until the same primary parser
-# succeeds, so complex pages retain the conservative behavior automatically.
-PDF_PAGE_WINDOW = int(os.environ.get("RAG_PDF_PAGE_WINDOW", "12"))
+def _configured_positive_int(name: str, default: int = 0) -> int:
+    """Read an optional positive override; zero and ``auto`` mean automatic."""
+
+    raw_value = str(os.environ.get(name, default)).strip().lower()
+    if raw_value in {"", "0", "auto"}:
+        return 0
+    value = int(raw_value)
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer or 'auto'.")
+    return value
 
 
-def recommended_docling_threads(cpu_count: int | None = None) -> int:
-    """Use modest CPU parallelism without multiplying native-memory pressure."""
-
-    available = max(1, int(cpu_count or os.cpu_count() or 1))
-    return max(2, min(4, available // 2))
-
-
-def recommended_docling_batch_size(total_memory_mb: int | None) -> int:
-    """Select a quality-neutral model batch from total accelerator memory."""
-
-    if total_memory_mb is None or total_memory_mb < 8_192:
-        return 2
-    if total_memory_mb < 12_288:
-        return 3
-    return 4
+# Zero means that the value is selected from live machine headroom in main().
+# Explicit environment values remain available for reproducible benchmarking.
+PDF_PAGE_WINDOW = _configured_positive_int("RAG_PDF_PAGE_WINDOW")
+DOCLING_PAGE_BATCH_SIZE = _configured_positive_int("RAG_DOCLING_PAGE_BATCH_SIZE")
+DOCLING_QUEUE_MAX_SIZE = _configured_positive_int("RAG_DOCLING_QUEUE_MAX_SIZE")
+DOCLING_MODEL_BATCH_SIZE = _configured_positive_int("RAG_DOCLING_MODEL_BATCH_SIZE")
+DOCLING_NUM_THREADS = _configured_positive_int("RAG_DOCLING_NUM_THREADS")
 
 
-def detected_accelerator_memory_mb() -> int | None:
+@dataclass(frozen=True)
+class MachineResources:
+    """A point-in-time resource snapshot used only for performance tuning."""
+
+    cpu_count: int
+    system_available_mb: int | None
+    system_total_mb: int | None
+    accelerator_available_mb: int | None
+    accelerator_total_mb: int | None
+
+
+@dataclass(frozen=True)
+class IngestionTuning:
+    """Quality-neutral Docling settings derived from current free resources."""
+
+    page_window: int
+    page_batch_size: int
+    model_batch_size: int
+    queue_max_size: int
+    num_threads: int
+    resources: MachineResources
+
+
+def system_memory_info_mb() -> tuple[int, int] | None:
+    """Return currently available and total physical RAM using the stdlib."""
+
+    if os.name == "nt":
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        try:
+            succeeded = ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                ctypes.byref(status)
+            )
+        except (AttributeError, OSError):
+            succeeded = 0
+        if succeeded:
+            divisor = 1024 * 1024
+            return (
+                int(status.ullAvailPhys // divisor),
+                int(status.ullTotalPhys // divisor),
+            )
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    divisor = 1024 * 1024
+    return (
+        int(available_pages * page_size // divisor),
+        int(total_pages * page_size // divisor),
+    )
+
+
+def accelerator_memory_info_mb() -> tuple[int, int] | None:
+    """Return live free and total accelerator memory, when it is measurable."""
+
     if not DOCLING_DEVICE.startswith("cuda") or not torch.cuda.is_available():
         return None
     try:
-        return int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
-    except Exception:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except (RuntimeError, OSError):
         return None
+    divisor = 1024 * 1024
+    return int(free_bytes // divisor), int(total_bytes // divisor)
 
 
-_AUTO_DOCLING_BATCH_SIZE = recommended_docling_batch_size(
-    detected_accelerator_memory_mb()
-)
-DOCLING_PAGE_BATCH_SIZE = int(
-    os.environ.get("RAG_DOCLING_PAGE_BATCH_SIZE", str(_AUTO_DOCLING_BATCH_SIZE))
-)
-DOCLING_QUEUE_MAX_SIZE = int(
-    os.environ.get("RAG_DOCLING_QUEUE_MAX_SIZE", "16")
-)
-DOCLING_MODEL_BATCH_SIZE = int(
-    os.environ.get("RAG_DOCLING_MODEL_BATCH_SIZE", str(_AUTO_DOCLING_BATCH_SIZE))
-)
-DOCLING_NUM_THREADS = int(
-    os.environ.get("RAG_DOCLING_NUM_THREADS", str(recommended_docling_threads()))
-)
+def machine_resources() -> MachineResources:
+    system_memory = system_memory_info_mb()
+    accelerator_memory = accelerator_memory_info_mb()
+    return MachineResources(
+        cpu_count=max(1, int(os.cpu_count() or 1)),
+        system_available_mb=system_memory[0] if system_memory else None,
+        system_total_mb=system_memory[1] if system_memory else None,
+        accelerator_available_mb=(
+            accelerator_memory[0] if accelerator_memory else None
+        ),
+        accelerator_total_mb=accelerator_memory[1] if accelerator_memory else None,
+    )
+
+
+def recommended_docling_threads(
+    cpu_count: int | None = None,
+    system_available_mb: int | None = None,
+) -> int:
+    """Use CPU parallelism only while live RAM can support native workers."""
+
+    cpu_limit = max(1, int(cpu_count or os.cpu_count() or 1) // 2)
+    memory_limit = (
+        max(1, (int(system_available_mb) - 1024) // 3072)
+        if system_available_mb is not None
+        else 2
+    )
+    return max(1, min(4, cpu_limit, memory_limit))
+
+
+def recommended_docling_batch_size(
+    accelerator_available_mb: int | None,
+    system_available_mb: int | None = None,
+) -> int:
+    """Choose model batches from live free memory rather than GPU capacity."""
+
+    limits: list[int] = []
+    if accelerator_available_mb is not None:
+        limits.append(max(1, (int(accelerator_available_mb) - 1024) // 2048))
+    if system_available_mb is not None:
+        limits.append(max(1, (int(system_available_mb) - 2048) // 3072))
+    return max(1, min(4, *(limits or [1])))
+
+
+def recommended_page_window(
+    accelerator_available_mb: int | None,
+    system_available_mb: int | None,
+) -> int:
+    """Size conversion windows continuously from current memory headroom."""
+
+    limits: list[int] = []
+    if accelerator_available_mb is not None:
+        limits.append(max(2, (int(accelerator_available_mb) - 512) // 768))
+    if system_available_mb is not None:
+        limits.append(max(2, (int(system_available_mb) - 1024) // 1280))
+    return max(2, min(16, *(limits or [4])))
+
+
+def resolve_ingestion_tuning(
+    resources: MachineResources | None = None,
+) -> IngestionTuning:
+    """Resolve automatic tuning once, before Docling allocates its models."""
+
+    resources = resources or machine_resources()
+    automatic_window = recommended_page_window(
+        resources.accelerator_available_mb,
+        resources.system_available_mb,
+    )
+    automatic_batch = recommended_docling_batch_size(
+        resources.accelerator_available_mb,
+        resources.system_available_mb,
+    )
+    page_window = PDF_PAGE_WINDOW or automatic_window
+    page_batch_size = DOCLING_PAGE_BATCH_SIZE or automatic_batch
+    model_batch_size = DOCLING_MODEL_BATCH_SIZE or automatic_batch
+    num_threads = DOCLING_NUM_THREADS or recommended_docling_threads(
+        resources.cpu_count,
+        resources.system_available_mb,
+    )
+    automatic_queue = max(
+        4,
+        min(
+            16,
+            page_window * 2,
+            max(4, int(resources.system_available_mb or 3072) // 768),
+        ),
+    )
+    return IngestionTuning(
+        page_window=page_window,
+        page_batch_size=page_batch_size,
+        model_batch_size=model_batch_size,
+        queue_max_size=DOCLING_QUEUE_MAX_SIZE or automatic_queue,
+        num_threads=num_threads,
+        resources=resources,
+    )
 # The CUDA-prefixed settings remain accepted for compatibility with existing
 # installations. ROCm exposes memory through the same torch.cuda API.
 CUDA_HEADROOM_WARNING_MB = int(
@@ -191,7 +341,7 @@ EXPORT_DEBUG_FILES = True
 INDEX_COMMIT_WAIT_SECONDS = 120
 
 # Increment whenever chunking, prompts, or metadata change materially.
-INGESTION_VERSION = "docling-hybrid-structural-v8-page1-title-qwen"
+INGESTION_VERSION = "docling-hybrid-structural-v9-verified-pages-qwen"
 MANIFEST_SCHEMA_VERSION = 2
 
 
@@ -317,18 +467,23 @@ def is_cuda_out_of_memory(message: str | None) -> bool:
     return is_gpu_out_of_memory(message)
 
 
-def report_cuda_headroom() -> None:
+def report_cuda_headroom(resources: MachineResources | None = None) -> None:
     """Warn when other resident models leave little accelerator memory."""
 
     if not DOCLING_DEVICE.startswith("cuda") or not torch.cuda.is_available():
         return
-    try:
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-    except Exception as error:
-        print(f"GPU memory status unavailable: {error}")
+    memory = (
+        (
+            resources.accelerator_available_mb,
+            resources.accelerator_total_mb,
+        )
+        if resources is not None
+        else accelerator_memory_info_mb()
+    )
+    if memory is None or memory[0] is None or memory[1] is None:
+        print("GPU memory status unavailable.")
         return
-    free_mb = free_bytes // (1024 * 1024)
-    total_mb = total_bytes // (1024 * 1024)
+    free_mb, total_mb = memory
     accelerator = backend_label(COMPUTE_BACKEND)
     print(
         f"{accelerator} memory before Docling: "
@@ -419,10 +574,6 @@ def ingestion_fingerprint(tokenizer_name: str, ocr_policy: str) -> str:
             "min_chunk_tokens": MIN_CHUNK_TOKENS,
             "retrieval_child_tokens": RETRIEVAL_CHILD_TOKENS,
             "retrieval_child_overlap_tokens": RETRIEVAL_CHILD_OVERLAP_TOKENS,
-            "pdf_page_window": PDF_PAGE_WINDOW,
-            "docling_page_batch_size": DOCLING_PAGE_BATCH_SIZE,
-            "docling_queue_max_size": DOCLING_QUEUE_MAX_SIZE,
-            "docling_model_batch_size": DOCLING_MODEL_BATCH_SIZE,
             "ocr_policy": ocr_policy,
             "table_structure": ENABLE_TABLE_STRUCTURE,
             "table_mode": str(TABLE_MODE),
@@ -471,17 +622,19 @@ class ChunkingRuntime:
 def create_converter(
     enable_ocr: bool = ENABLE_OCR,
     pdf_backend: type[Any] | None = None,
+    tuning: IngestionTuning | None = None,
 ) -> DocumentConverter:
-    settings.perf.page_batch_size = DOCLING_PAGE_BATCH_SIZE
+    tuning = tuning or resolve_ingestion_tuning()
+    settings.perf.page_batch_size = tuning.page_batch_size
     settings.perf.page_batch_concurrency = 1
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = enable_ocr
     pipeline_options.do_table_structure = ENABLE_TABLE_STRUCTURE
-    pipeline_options.queue_max_size = DOCLING_QUEUE_MAX_SIZE
-    pipeline_options.ocr_batch_size = DOCLING_MODEL_BATCH_SIZE
-    pipeline_options.layout_batch_size = DOCLING_MODEL_BATCH_SIZE
-    pipeline_options.table_batch_size = DOCLING_MODEL_BATCH_SIZE
-    pipeline_options.accelerator_options.num_threads = DOCLING_NUM_THREADS
+    pipeline_options.queue_max_size = tuning.queue_max_size
+    pipeline_options.ocr_batch_size = tuning.model_batch_size
+    pipeline_options.layout_batch_size = tuning.model_batch_size
+    pipeline_options.table_batch_size = tuning.model_batch_size
+    pipeline_options.accelerator_options.num_threads = tuning.num_threads
     pipeline_options.accelerator_options.device = DOCLING_DEVICE
 
     if ENABLE_TABLE_STRUCTURE:
@@ -1605,6 +1758,19 @@ def conversion_problem(
     return " | ".join(details) or None
 
 
+@dataclass
+class AdaptivePageWindow:
+    """Lower future window sizes after this document shows memory pressure."""
+
+    current: int
+    minimum: int = 1
+
+    def observe_memory_pressure(self, attempted_pages: int) -> None:
+        if attempted_pages < self.current:
+            return
+        self.current = max(self.minimum, min(self.current, attempted_pages // 2))
+
+
 def convert_page_range_resilient(
     converter: DocumentConverter,
     pdf_path: Path,
@@ -1613,6 +1779,7 @@ def convert_page_range_resilient(
     *,
     fallback_converter: DocumentConverter | None = None,
     source_name: str | None = None,
+    on_memory_pressure: Callable[[int], None] | None = None,
 ) -> list[Any]:
     """Convert a range, recursively splitting it after native/page failures."""
 
@@ -1636,6 +1803,9 @@ def convert_page_range_resilient(
     # preprocessing run, not a malformed PDF. Retry the same high-quality
     # parser on smaller ranges before changing parser backends.
     if allocation_failure and page_start < page_end:
+        attempted_pages = page_end - page_start + 1
+        if on_memory_pressure is not None:
+            on_memory_pressure(attempted_pages)
         midpoint = (page_start + page_end) // 2
         print(
             f"  Memory pressure on pages {page_start}-{page_end}; "
@@ -1650,6 +1820,7 @@ def convert_page_range_resilient(
             midpoint,
             fallback_converter=fallback_converter,
             source_name=source_name,
+            on_memory_pressure=on_memory_pressure,
         ) + convert_page_range_resilient(
             converter,
             pdf_path,
@@ -1657,6 +1828,7 @@ def convert_page_range_resilient(
             page_end,
             fallback_converter=fallback_converter,
             source_name=source_name,
+            on_memory_pressure=on_memory_pressure,
         )
 
     if not gpu_oom and fallback_converter is not None:
@@ -1714,6 +1886,7 @@ def convert_page_range_resilient(
         midpoint,
         fallback_converter=fallback_converter,
         source_name=source_name,
+        on_memory_pressure=on_memory_pressure,
     ) + convert_page_range_resilient(
         converter,
         pdf_path,
@@ -1721,6 +1894,7 @@ def convert_page_range_resilient(
         page_end,
         fallback_converter=fallback_converter,
         source_name=source_name,
+        on_memory_pressure=on_memory_pressure,
     )
 
 
@@ -1729,6 +1903,89 @@ def should_retry_with_ocr(markdown: str, page_count: int) -> bool:
         return not clean_text(markdown)
     extracted_characters = len(re.sub(r"\s+", "", markdown))
     return extracted_characters / page_count < MIN_EXTRACTED_CHARS_PER_PAGE
+
+
+def record_page_numbers(records: Sequence[ChunkRecord]) -> set[int]:
+    """Collect every physical PDF page represented by chunk provenance."""
+
+    pages: set[int] = set()
+    for record in records:
+        for location in record.locations:
+            try:
+                page = int(location.get("page") or 0)
+            except (TypeError, ValueError):
+                continue
+            if page > 0:
+                pages.add(page)
+    return pages
+
+
+def extractable_text_pages(
+    pdf_path: Path,
+    page_numbers: Iterable[int],
+    *,
+    minimum_characters: int = MIN_CHUNK_TOKENS,
+) -> set[int]:
+    """Return pages whose source PDF contains enough text to require a chunk."""
+
+    required_pages = sorted({int(page) for page in page_numbers if int(page) > 0})
+    if not required_pages:
+        return set()
+    document = pdfium.PdfDocument(str(pdf_path))
+    extractable: set[int] = set()
+    try:
+        for page_number in required_pages:
+            if page_number > len(document):
+                continue
+            page = document[page_number - 1]
+            text_page = None
+            try:
+                text_page = page.get_textpage()
+                text = text_page.get_text_range() or ""
+            finally:
+                if text_page is not None:
+                    text_page.close()
+                page.close()
+            if len(re.sub(r"\s+", "", text)) >= minimum_characters:
+                extractable.add(page_number)
+    finally:
+        document.close()
+    return extractable
+
+
+def missing_extractable_pages(
+    pdf_path: Path,
+    records: Sequence[ChunkRecord],
+    page_count: int,
+) -> list[int]:
+    """Find source pages with text but no indexed passage provenance."""
+
+    represented_pages = record_page_numbers(records)
+    unrepresented_pages = set(range(1, page_count + 1)) - represented_pages
+    return sorted(extractable_text_pages(pdf_path, unrepresented_pages))
+
+
+def emit_ingestion_progress(
+    source_id: str,
+    message: str,
+    *,
+    phase: str,
+    page_start: int | None = None,
+    page_end: int | None = None,
+    page_count: int | None = None,
+) -> None:
+    """Send structured UI progress and a flushed human-readable log line."""
+
+    emit_corpus_event(
+        "progress",
+        source_id=source_id,
+        phase=phase,
+        message=message,
+        page_start=page_start,
+        page_end=page_end,
+        page_count=page_count,
+    )
+    print(f"  {message}", flush=True)
 
 
 def process_pdf(
@@ -1746,6 +2003,7 @@ def process_pdf(
     ocr_fallback_converter: DocumentConverter | None = None,
     docling_pdf_path: Path | None = None,
     commit_gate: Path | None = None,
+    tuning: IngestionTuning | None = None,
 ) -> ProcessResult:
     process_started = time.perf_counter()
     timings: dict[str, float] = {}
@@ -1779,6 +2037,7 @@ def process_pdf(
         print(f"  Unchanged; keeping {len(existing_ids)} existing chunks.")
         return ProcessResult(status="unchanged")
 
+    tuning = tuning or resolve_ingestion_tuning()
     conversion_path = docling_pdf_path or pdf_path
     page_count = get_pdf_page_count(conversion_path)
     if page_count <= 0:
@@ -1788,19 +2047,28 @@ def process_pdf(
     records: list[ChunkRecord] = []
     markdown_parts: list[str] = []
     carried_headings: list[str] = []
-    for page_start in range(1, page_count + 1, PDF_PAGE_WINDOW):
-        page_end = min(page_start + PDF_PAGE_WINDOW - 1, page_count)
-        print(f"  Converting pages {page_start}-{page_end} of {page_count}")
-        with measure_stage(timings, "conversion"):
-            base_results = convert_page_range_resilient(
-                converter,
-                conversion_path,
-                page_start,
-                page_end,
-                fallback_converter=fallback_converter,
-                source_name=pdf_path.name,
+    page_window = AdaptivePageWindow(tuning.page_window)
+
+    def lower_future_windows(attempted_pages: int) -> None:
+        previous_window = page_window.current
+        page_window.observe_memory_pressure(attempted_pages)
+        if page_window.current < previous_window:
+            emit_ingestion_progress(
+                source_id,
+                (
+                    "Memory pressure detected; future conversion windows were "
+                    f"reduced from {previous_window} to {page_window.current} pages."
+                ),
+                phase="tuning",
+                page_count=page_count,
             )
 
+    def consume_results(
+        base_results: list[Any],
+        *,
+        inherit_previous_headings: bool,
+    ) -> None:
+        nonlocal carried_headings
         while base_results:
             base_result = base_results.pop(0)
             base_document = base_result.document
@@ -1819,9 +2087,16 @@ def process_pdf(
                         "Automatic OCR was requested without an OCR converter."
                     )
                 retry_start, retry_end = base_pages[0], base_pages[-1]
-                print(
-                    f"  Sparse text on pages {retry_start}-{retry_end}; "
-                    "retrying that range with OCR."
+                emit_ingestion_progress(
+                    source_id,
+                    (
+                        f"Sparse text on pages {retry_start}-{retry_end}; "
+                        "retrying that range with OCR."
+                    ),
+                    phase="ocr",
+                    page_start=retry_start,
+                    page_end=retry_end,
+                    page_count=page_count,
                 )
                 with measure_stage(timings, "conversion"):
                     ocr_results = convert_page_range_resilient(
@@ -1831,6 +2106,7 @@ def process_pdf(
                         retry_end,
                         fallback_converter=ocr_fallback_converter,
                         source_name=pdf_path.name,
+                        on_memory_pressure=lower_future_windows,
                     )
                 final_results = [(result, True) for result in ocr_results]
                 base_result = None
@@ -1848,11 +2124,14 @@ def process_pdf(
                         runtime,
                         ocr_applied=ocr_applied,
                     )
-                    window_records, carried_headings = stitch_window_headings(
+                    inherited = carried_headings if inherit_previous_headings else []
+                    window_records, active_headings = stitch_window_headings(
                         window_records,
-                        carried_headings,
+                        inherited,
                         runtime,
                     )
+                    if inherit_previous_headings:
+                        carried_headings = active_headings
                     records.extend(window_records)
                 del raw_chunks, docling_document, final_result
                 gc.collect()
@@ -1861,7 +2140,77 @@ def process_pdf(
             base_document = None
             gc.collect()
 
+    page_start = 1
+    while page_start <= page_count:
+        page_end = min(page_start + page_window.current - 1, page_count)
+        emit_ingestion_progress(
+            source_id,
+            f"Converting pages {page_start}-{page_end} of {page_count}",
+            phase="conversion",
+            page_start=page_start,
+            page_end=page_end,
+            page_count=page_count,
+        )
+        with measure_stage(timings, "conversion"):
+            base_results = convert_page_range_resilient(
+                converter,
+                conversion_path,
+                page_start,
+                page_end,
+                fallback_converter=fallback_converter,
+                source_name=pdf_path.name,
+                on_memory_pressure=lower_future_windows,
+            )
+        consume_results(base_results, inherit_previous_headings=True)
         release_cuda_memory()
+        page_start = page_end + 1
+
+    pages_to_recover = missing_extractable_pages(
+        conversion_path,
+        records,
+        page_count,
+    )
+    for page_number in pages_to_recover:
+        emit_ingestion_progress(
+            source_id,
+            f"Verifying and retrying omitted text page {page_number} of {page_count}",
+            phase="page_recovery",
+            page_start=page_number,
+            page_end=page_number,
+            page_count=page_count,
+        )
+        with measure_stage(timings, "conversion"):
+            recovery_results = convert_page_range_resilient(
+                converter,
+                conversion_path,
+                page_number,
+                page_number,
+                fallback_converter=fallback_converter,
+                source_name=pdf_path.name,
+                on_memory_pressure=lower_future_windows,
+            )
+        consume_results(recovery_results, inherit_previous_headings=False)
+        release_cuda_memory()
+
+    still_missing = missing_extractable_pages(
+        conversion_path,
+        records,
+        page_count,
+    )
+    if still_missing:
+        preview = ", ".join(str(page) for page in still_missing[:20])
+        suffix = " ..." if len(still_missing) > 20 else ""
+        raise RuntimeError(
+            "Refusing to mark the document indexed because extractable text "
+            f"is still missing from pages {preview}{suffix}."
+        )
+
+    records.sort(
+        key=lambda record: (
+            min(record_page_numbers([record]) or {page_count + 1}),
+            record.original_indices[0] if record.original_indices else 0,
+        )
+    )
 
     with measure_stage(timings, "postprocess"):
         markdown = "\n\n".join(markdown_parts)
@@ -2172,17 +2521,39 @@ def main() -> None:
     print(f"OCR enabled: {ocr_enabled}")
     print(f"Automatic OCR fallback: {auto_ocr}")
     print(f"Table structure enabled: {ENABLE_TABLE_STRUCTURE}")
+    tuning = resolve_ingestion_tuning()
+    resources = tuning.resources
+    system_memory_label = (
+        f"{resources.system_available_mb} MiB free / "
+        f"{resources.system_total_mb} MiB total"
+        if resources.system_available_mb is not None
+        and resources.system_total_mb is not None
+        else "unavailable"
+    )
+    accelerator_memory_label = (
+        f"{resources.accelerator_available_mb} MiB free / "
+        f"{resources.accelerator_total_mb} MiB total"
+        if resources.accelerator_available_mb is not None
+        and resources.accelerator_total_mb is not None
+        else "not available"
+    )
+    print(
+        "Live resources: "
+        f"{resources.cpu_count} logical CPUs, RAM {system_memory_label}, "
+        f"accelerator {accelerator_memory_label}"
+    )
     print(
         "Adaptive conversion: "
-        f"{PDF_PAGE_WINDOW}-page windows, "
-        f"page/model batches {DOCLING_PAGE_BATCH_SIZE}/{DOCLING_MODEL_BATCH_SIZE}, "
-        f"{DOCLING_NUM_THREADS} preprocessing threads"
+        f"{tuning.page_window}-page windows, "
+        f"page/model batches {tuning.page_batch_size}/{tuning.model_batch_size}, "
+        f"queue {tuning.queue_max_size}, "
+        f"{tuning.num_threads} preprocessing threads"
     )
     print(
         "Embedding cache: "
         + (str(EMBEDDING_CACHE_PATH) if EMBEDDING_CACHE_ENABLED else "disabled")
     )
-    report_cuda_headroom()
+    report_cuda_headroom(resources)
 
     collection = create_collection()
     manifest = load_manifest()
@@ -2206,14 +2577,21 @@ def main() -> None:
         print(f"Pruned documents: {pruned_documents}")
         return
 
-    converter = create_converter(enable_ocr=ocr_enabled)
+    converter = create_converter(enable_ocr=ocr_enabled, tuning=tuning)
     fallback_converter = create_converter(
         enable_ocr=ocr_enabled,
         pdf_backend=PyPdfiumDocumentBackend,
+        tuning=tuning,
     )
-    ocr_converter = create_converter(enable_ocr=True) if auto_ocr else None
+    ocr_converter = (
+        create_converter(enable_ocr=True, tuning=tuning) if auto_ocr else None
+    )
     ocr_fallback_converter = (
-        create_converter(enable_ocr=True, pdf_backend=PyPdfiumDocumentBackend)
+        create_converter(
+            enable_ocr=True,
+            pdf_backend=PyPdfiumDocumentBackend,
+            tuning=tuning,
+        )
         if auto_ocr
         else None
     )
@@ -2253,6 +2631,7 @@ def main() -> None:
                     ocr_fallback_converter=ocr_fallback_converter,
                     docling_pdf_path=conversion_path,
                     commit_gate=args.commit_gate,
+                    tuning=tuning,
                 )
 
             if result.status == "unchanged":

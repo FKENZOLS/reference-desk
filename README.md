@@ -268,10 +268,17 @@ become the book title; image-only covers fall back to the filename.
 
 #### Quality-preserving performance
 
-The default converter begins with 12-page windows. Allocation failures split
-the same primary parser range recursively before changing backends. Model batch
-size is selected conservatively from accelerator memory: 2 below 8 GB, 3 from
-8–12 GB, and 4 above 12 GB. CPU preprocessing uses at most four threads.
+At the beginning of each ingestion run, the converter measures currently free
+GPU memory, currently free system RAM, and logical CPU count. It derives page
+windows, model batches, queue depth, and preprocessing threads from that live
+snapshot instead of applying a fixed VRAM-size tier. Explicit environment
+overrides remain available for controlled benchmarks.
+
+Allocation failures split the same primary-parser range recursively before
+changing backends and reduce the window used by the rest of that document.
+Pages that contain extractable source text but produce no indexed provenance
+are retried individually, including automatic OCR when needed. The index commit
+is rejected if text-bearing pages remain omitted.
 
 Document embeddings are cached as float32 vectors using a key derived from the
 exact title-aware prompt and immutable embedding fingerprint. A changed title,
@@ -353,7 +360,7 @@ Other reliability measures include:
 
 - automatic GPU headroom checks and exclusive-ingestion fallback;
 - per-document failure isolation;
-- recursive page recovery and PDFium fallback;
+- recursive page recovery, source-text coverage validation, and PDFium fallback;
 - isolated reranker worker health and restart state;
 - versioned SQLite and manifest migrations with pre-migration backups;
 - validated corpus backup and restore; and
@@ -510,10 +517,11 @@ operational reason.
 | `RAG_ACCELERATOR` | Select `auto`, `cuda`, `rocm`, or `cpu` |
 | `RAG_RERANKER_CHOICE` | Select `gte` or `bge` |
 | `RAG_SEARCH_DURING_INGESTION` | Select `auto`, `never`, or `always` |
-| `RAG_PDF_PAGE_WINDOW` | Initial adaptive Docling page window |
-| `RAG_DOCLING_PAGE_BATCH_SIZE` | Docling page preprocessing batch |
-| `RAG_DOCLING_MODEL_BATCH_SIZE` | Layout, OCR, and table model batch |
-| `RAG_DOCLING_NUM_THREADS` | Native preprocessing thread count |
+| `RAG_PDF_PAGE_WINDOW` | Override the automatic Docling page window |
+| `RAG_DOCLING_PAGE_BATCH_SIZE` | Override the automatic page preprocessing batch |
+| `RAG_DOCLING_MODEL_BATCH_SIZE` | Override the automatic layout, OCR, and table model batch |
+| `RAG_DOCLING_QUEUE_MAX_SIZE` | Override the automatic Docling queue depth |
+| `RAG_DOCLING_NUM_THREADS` | Override the automatic native preprocessing thread count |
 | `RAG_EMBEDDING_CACHE` | Set to `0` to disable document-vector reuse |
 | `RAG_DEBUG_RETRIEVAL` | Enable detailed retrieval diagnostics by default |
 | `RAG_SERVER_HOST`, `RAG_SERVER_PORT` | Change the local server binding |

@@ -813,6 +813,10 @@ def _handle_corpus_event(line: str) -> bool:
                 reason="Ingestion worker started processing",
             )
         _update_document_job(message=f"Processing {source_id}")
+    elif kind == "progress":
+        message = str(event.get("message") or "").strip()
+        if message:
+            _update_document_job(message=message)
     elif kind == "commit_requested":
         token = str(event.get("token") or "")
         if token:
@@ -1031,7 +1035,12 @@ def _run_document_index_job(
             hasattr(DOCUMENT_REPOSITORY, "clear_pending_sources")
             and CORPUS_SCALE.repository is DOCUMENT_REPOSITORY
         )
-        command = [sys.executable, str(Path(__file__).with_name("ingest.py")), "--prune"]
+        command = [
+            sys.executable,
+            "-u",
+            str(Path(__file__).with_name("ingest.py")),
+            "--prune",
+        ]
         if managed_queue:
             command.extend(
                 ("--queue-managed", "--queue-control", str(CORPUS_SCALE.state_path))
@@ -1045,6 +1054,7 @@ def _run_document_index_job(
         exclusive_prune_command = list(prune_command) if managed_queue else []
         environment = os.environ.copy()
         environment["RAG_OPEN_BROWSER"] = "0"
+        environment["PYTHONUNBUFFERED"] = "1"
         if search_available:
             # Docling independently refuses to start if real free VRAM falls
             # below this combined reserve after the child process starts.

@@ -73,8 +73,11 @@ workspace matters.
 5. Manual pruning stays explicit. The document manager may request pruning
    because it owns the staged file changes.
 6. Search and ingestion may share a GPU only when live free VRAM covers the
-   Docling headroom plus a query reserve. Otherwise ingestion releases search
-   models and runs exclusively; total VRAM alone is not the deciding factor.
+   Docling headroom plus a query reserve. Docling page windows, model batches,
+   queue depth, and CPU threads are derived from live free VRAM, free system
+   RAM, and CPU count rather than fixed GPU-capacity tiers. Otherwise ingestion
+   releases search models and runs exclusively; total VRAM alone is not the
+   deciding factor.
    If the child detects that headroom disappeared after the parent's check,
    auto mode must release search and retry the same queue once exclusively.
    When concurrent, an app-controlled commit gate pauses search while Chroma,
@@ -87,8 +90,10 @@ workspace matters.
    triggering an update blindly.
 9. An embedding-cache key includes the embedding fingerprint and exact
    title-aware document prompt. Allocation failures split the primary Docling
-   parser range before a fallback backend is selected; neither optimization may
-   silently omit a page or reuse a vector from another model revision.
+   parser range before a fallback backend is selected. Text-bearing pages with
+   no chunk provenance are retried individually and prevent the commit if they
+   remain missing; neither optimization may silently omit source text or reuse
+   a vector from another model revision.
    Document titles may come only from credible page-one evidence or the source
    filename; inherited headings from later pages are never document metadata.
 8. Workspace data is independent from ingestion and must survive index rebuilds.
