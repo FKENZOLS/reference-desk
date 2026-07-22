@@ -2,6 +2,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -383,6 +384,51 @@ def test_structured_ingestion_progress_updates_the_visible_job(monkeypatch) -> N
         search_app.document_job_snapshot()["message"]
         == "Converting pages 13-18 of 100"
     )
+
+
+def test_storage_optimization_route_requires_current_index_and_pauses_search(
+    monkeypatch,
+) -> None:
+    pending_sources = []
+    calls = []
+    repository = SimpleNamespace(
+        summary=lambda: {
+            "pending_sources": list(pending_sources),
+            "deleted_sources": [],
+        }
+    )
+    corpus = SimpleNamespace(
+        optimize_storage=lambda: calls.append("optimize") or {
+            "reclaimed_bytes": 1024,
+            "chunks_verified": 3,
+        }
+    )
+    maintenance = threading.Event()
+    monkeypatch.setattr(search_app, "DOCUMENT_REPOSITORY", repository)
+    monkeypatch.setattr(search_app, "CORPUS_SCALE", corpus)
+    monkeypatch.setattr(search_app, "_DOCUMENT_MAINTENANCE", maintenance)
+    monkeypatch.setattr(search_app, "_SEARCH_MAINTENANCE_LOCK", threading.Lock())
+    monkeypatch.setattr(search_app, "_STORAGE_OPTIMIZATION_LOCK", threading.Lock())
+    monkeypatch.setattr(search_app, "_release_search_runtime", lambda: calls.append("release"))
+    monkeypatch.setattr(search_app, "_notify", lambda **values: calls.append(values["status"]))
+    monkeypatch.setattr(
+        search_app,
+        "_DOCUMENT_JOB",
+        {"running": False, "message": "", "log": []},
+    )
+
+    client = TestClient(search_app.create_web_app(gr.Blocks()))
+    response = client.post("/documents/api/optimize")
+
+    assert response.status_code == 200
+    assert response.json()["chunks_verified"] == 3
+    assert calls == ["release", "optimize", "success"]
+    assert not maintenance.is_set()
+
+    pending_sources.append("manual.pdf")
+    blocked = client.post("/documents/api/optimize")
+    assert blocked.status_code == 409
+    assert "Apply pending" in blocked.json()["detail"]
 
 
 def test_successful_background_job_clears_pending_changes(monkeypatch) -> None:

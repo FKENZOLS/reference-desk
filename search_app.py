@@ -557,6 +557,8 @@ CORPUS_SCALE = CorpusScaleManager(
     workspace_db=WORKSPACE_STORE.path,
     backup_dir=PDF_DIR.parent / "corpus_backups",
     debug_dir=DEBUG_DIR,
+    collection_name=COLLECTION_NAME,
+    lexical_db=LEXICAL_DB_PATH,
 )
 MAX_DOCUMENT_UPLOAD_BYTES = int(
     os.environ.get("RAG_MAX_DOCUMENT_UPLOAD_BYTES", str(1024 * 1024 * 1024))
@@ -565,6 +567,7 @@ _SEARCH_MAINTENANCE_LOCK = threading.Lock()
 _DOCUMENT_MAINTENANCE = threading.Event()
 _DOCUMENT_JOB_LOCK = threading.Lock()
 _EXPERIMENT_LOCK = threading.Lock()
+_STORAGE_OPTIMIZATION_LOCK = threading.Lock()
 _EXPERIMENT_ACTIVE = threading.Event()
 _APP_RESTARTING = threading.Event()
 _APP_INSTANCE_ID = token_urlsafe(8)
@@ -5496,6 +5499,67 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
     @app.get("/documents/api/backups", include_in_schema=False)
     def list_corpus_backups() -> dict[str, Any]:
         return {"backups": CORPUS_SCALE.list_backups()}
+
+    @app.post("/documents/api/optimize", include_in_schema=False)
+    def optimize_corpus_storage() -> dict[str, Any]:
+        global _APP_INSTANCE_ID
+
+        if document_job_snapshot().get("running"):
+            raise HTTPException(
+                status_code=409,
+                detail="Pause or finish ingestion before optimizing storage.",
+            )
+        summary = DOCUMENT_REPOSITORY.summary()
+        if summary.get("pending_sources") or summary.get("deleted_sources"):
+            raise HTTPException(
+                status_code=409,
+                detail="Apply pending document changes before optimizing storage.",
+            )
+        if not _STORAGE_OPTIMIZATION_LOCK.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail="Storage optimization is already running.",
+            )
+
+        _DOCUMENT_MAINTENANCE.set()
+        try:
+            with _SEARCH_MAINTENANCE_LOCK:
+                _release_search_runtime()
+                result = CORPUS_SCALE.optimize_storage()
+                _APP_INSTANCE_ID = token_urlsafe(8)
+                _notify(
+                    kind="maintenance",
+                    title="Corpus storage optimized",
+                    message=(
+                        f"Reclaimed {result['reclaimed_bytes']} bytes while "
+                        f"verifying {result['chunks_verified']} passages."
+                    ),
+                    status="success",
+                    task_key="corpus-optimize",
+                )
+                return result
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            sqlite3.Error,
+            zipfile.BadZipFile,
+        ) as error:
+            LOGGER.exception("Corpus storage optimization failed")
+            _notify(
+                kind="maintenance",
+                title="Storage optimization failed",
+                message=str(error),
+                status="error",
+                task_key="corpus-optimize",
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Storage optimization failed: {error}",
+            ) from error
+        finally:
+            _DOCUMENT_MAINTENANCE.clear()
+            _STORAGE_OPTIMIZATION_LOCK.release()
 
     @app.post("/documents/api/backups", include_in_schema=False)
     async def create_corpus_backup(request: Request) -> dict[str, Any]:

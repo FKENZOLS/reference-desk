@@ -30,6 +30,7 @@ export function DocumentsPage() {
   const [target, setTarget] = useState("")
   const [dragging, setDragging] = useState(false)
   const [backupBusy, setBackupBusy] = useState(false)
+  const [optimizeBusy, setOptimizeBusy] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
   async function refresh(silent = false) {
@@ -188,6 +189,17 @@ export function DocumentsPage() {
     finally { setBackupBusy(false) }
   }
 
+  async function optimizeStorage() {
+    if (!window.confirm("Optimize the local index now? Search will pause, a recovery backup will be created, and active passages will be verified before old storage is removed.")) return
+    setOptimizeBusy(true)
+    try {
+      const result = await api<{ reclaimed_bytes: number; chunks_verified: number }>("/documents/api/optimize", { method: "POST" })
+      toast.success(`Storage optimized. Reclaimed ${formatBytes(result.reclaimed_bytes)} and verified ${result.chunks_verified.toLocaleString()} passages.`)
+      await refresh(true)
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Could not optimize storage") }
+    finally { setOptimizeBusy(false) }
+  }
+
   async function restoreBackup(backupId: string) {
     if (!window.confirm("Restore this snapshot? Current documents, indexes, quarantine, revisions, and workspace data will be replaced.")) return
     setBackupBusy(true)
@@ -294,7 +306,7 @@ export function DocumentsPage() {
           <CardContent className="p-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-3"><div className="grid size-9 place-items-center rounded-lg bg-primary/10 text-primary">{health?.status === "healthy" ? <ShieldCheck /> : <ShieldAlert />}</div><div><p className="m-0 font-semibold">Corpus health</p><p className="mb-0 mt-1 text-xs text-muted-foreground">{health ? `${state.hardware?.backend === "rocm" ? "AMD ROCm" : state.hardware?.backend === "cuda" ? "NVIDIA CUDA" : "CPU"} · ${health.pages.toLocaleString()} pages · ${health.chunks.toLocaleString()} passages` : "Calculating"}</p></div></div>
-              <div className="flex items-center gap-2"><Badge variant={healthVariant}>{health?.status || "loading"}</Badge><Button size="icon" variant="ghost" aria-label="Refresh corpus health" onClick={refreshHealth}><RefreshCw /></Button></div>
+              <div className="flex items-center gap-2"><Badge variant={healthVariant}>{health?.status || "loading"}</Badge><Button size="sm" variant="outline" onClick={optimizeStorage} disabled={optimizeBusy || Boolean(state.job.running) || Boolean(state.counts.pending)}>{optimizeBusy ? <LoaderCircle className="animate-spin" /> : null} Optimize storage</Button><Button size="icon" variant="ghost" aria-label="Refresh corpus health" onClick={refreshHealth}><RefreshCw /></Button></div>
             </div>
             {health && <>
               <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -303,6 +315,7 @@ export function DocumentsPage() {
               <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
                 {[['Quarantine', health.storage.quarantine], ['Revisions', health.storage.revisions], ['Backups', health.storage.backups], ['Total', health.storage.total]].map(([label, value]) => <div key={String(label)} className="flex items-center justify-between gap-2 rounded-lg bg-muted/20 px-3 py-2 text-xs"><span className="text-muted-foreground">{label}</span><span className="tabular-nums">{formatBytes(Number(value))}</span></div>)}
               </div>
+              {Boolean(health.storage.reclaimable) && <p className="mb-0 mt-3 text-xs text-muted-foreground">At least {formatBytes(Number(health.storage.reclaimable))} can be reclaimed. Rebuilding the vector index may recover additional reserved capacity.</p>}
               {!!health.issues.length && <div className="mt-4 space-y-2">{health.issues.map((issue) => <div key={issue.label} className="flex items-center justify-between gap-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-sm"><span>{issue.label}</span><Badge variant="secondary">{issue.count}</Badge></div>)}</div>}
             </>}
           </CardContent>

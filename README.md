@@ -110,6 +110,15 @@ switching rerankers can therefore take longer.
 The backup includes the managed documents, indexes, queue state, revisions,
 quarantine, and research workspace. GitHub contains only application source.
 
+### Reclaim index storage
+
+After deleting or repeatedly reindexing large documents, open **Documents** and
+select **Optimize storage**. Reference Desk pauses search, creates a recovery
+backup, rebuilds the dense index from active vectors, removes orphaned segment
+and debug files, compacts the lexical databases, and verifies that manifest,
+dense, and lexical passage counts still match. Apply any pending document
+changes first. The recovery backup remains available until you delete it.
+
 ### Update the application
 
 For a Git-based installation, open **Advanced → Software updates**. The updater:
@@ -363,7 +372,7 @@ Other reliability measures include:
 - recursive page recovery, source-text coverage validation, and PDFium fallback;
 - isolated reranker worker health and restart state;
 - versioned SQLite and manifest migrations with pre-migration backups;
-- validated corpus backup and restore; and
+- validated corpus backup, restore, and rollback-safe storage optimization; and
 - fast-forward-only application updates protected by a confirmation token.
 
 ### Evaluation workbench
@@ -422,7 +431,7 @@ the intended document domain.
 | `rag_common.py` | Shared paths, embedding prompts, fingerprints, and Ollama client |
 | `reranker_worker.py` | Isolated model process and recovery protocol |
 | `document_manager.py` | Safe managed PDF operations and document state |
-| `corpus_scale.py` | Queue, health, quarantine, revisions, and backups |
+| `corpus_scale.py` | Queue, health, quarantine, revisions, backups, and index compaction |
 | `lexical_index.py` | FTS5 persistence and lexical retrieval |
 | `workspace_store.py` | Notes, feedback, benchmarks, experiments, notifications, and migrations |
 | `frontend/src` | React application source |

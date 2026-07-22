@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -22,6 +24,38 @@ from document_manager import DocumentRepository
 BACKUP_VERSION = 1
 PAUSED_EXIT_CODE = 75
 _TERMINAL_QUEUE_STATES = {"complete", "failed", "quarantined"}
+_CHROMA_SEGMENT_DIRECTORY = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    flags=re.IGNORECASE,
+)
+_DEBUG_ARTIFACT_NAME = re.compile(
+    r"^.+-[0-9a-f]{10}(?:\.md|\.chunks\.jsonl)$",
+    flags=re.IGNORECASE,
+)
+
+
+def debug_artifact_paths(debug_dir: Path, source_id: str) -> tuple[Path, Path]:
+    """Return the deterministic Markdown and chunk-debug paths for a source."""
+
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(source_id).stem)
+    suffix = hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:10]
+    base_path = debug_dir / f"{safe_stem}-{suffix}"
+    return base_path.with_suffix(".md"), base_path.with_suffix(".chunks.jsonl")
+
+
+def remove_debug_artifacts(debug_dir: Path | None, source_id: str) -> int:
+    """Delete only the two deterministic debug exports owned by a source."""
+
+    if debug_dir is None:
+        return 0
+    removed = 0
+    for path in debug_artifact_paths(debug_dir, source_id):
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+    return removed
 
 
 def utc_now() -> str:
@@ -58,6 +92,8 @@ class CorpusScaleManager:
         workspace_db: Path,
         backup_dir: Path,
         debug_dir: Path | None = None,
+        collection_name: str = "technical_docs_qwen_v1",
+        lexical_db: Path | None = None,
     ) -> None:
         self.repository = repository
         self.state_path = state_path.resolve()
@@ -65,6 +101,10 @@ class CorpusScaleManager:
         self.workspace_db = workspace_db.resolve()
         self.backup_dir = backup_dir.resolve()
         self.debug_dir = debug_dir.resolve() if debug_dir else None
+        self.collection_name = str(collection_name)
+        self.lexical_db = (
+            lexical_db.resolve() if lexical_db else self.db_dir / "lexical.sqlite3"
+        )
         self._lock = RLock()
         self._health_cache: tuple[float, dict[str, Any]] | None = None
         self._hash_cache: dict[str, tuple[int, int, str]] = {}
@@ -356,6 +396,385 @@ class CorpusScaleManager:
     def invalidate_health(self) -> None:
         self._health_cache = None
 
+    @staticmethod
+    def _sqlite_free_bytes(path: Path) -> int:
+        if not path.is_file():
+            return 0
+        try:
+            connection = sqlite3.connect(
+                f"file:{path.as_posix()}?mode=ro",
+                uri=True,
+            )
+            try:
+                page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+                free_pages = int(
+                    connection.execute("PRAGMA freelist_count").fetchone()[0]
+                )
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            return 0
+        return page_size * free_pages
+
+    def _referenced_chroma_segments(self) -> set[str]:
+        database = self.db_dir / "chroma.sqlite3"
+        if not database.is_file():
+            return set()
+        connection = sqlite3.connect(
+            f"file:{database.as_posix()}?mode=ro",
+            uri=True,
+        )
+        try:
+            return {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM segments WHERE scope = 'VECTOR'"
+                )
+            }
+        except sqlite3.Error:
+            return set()
+        finally:
+            connection.close()
+
+    def _chroma_segment_directories(self) -> list[Path]:
+        if not self.db_dir.is_dir():
+            return []
+        return [
+            child
+            for child in self.db_dir.iterdir()
+            if child.is_dir()
+            and _CHROMA_SEGMENT_DIRECTORY.fullmatch(child.name)
+            and (child / "header.bin").is_file()
+        ]
+
+    def _orphan_chroma_segments(self) -> list[Path]:
+        referenced = self._referenced_chroma_segments()
+        return [
+            path
+            for path in self._chroma_segment_directories()
+            if path.name not in referenced
+        ]
+
+    def _stale_debug_artifacts(self, active_sources: set[str]) -> list[Path]:
+        if self.debug_dir is None or not self.debug_dir.is_dir():
+            return []
+        expected = {
+            path.resolve()
+            for source_id in active_sources
+            for path in debug_artifact_paths(self.debug_dir, source_id)
+        }
+        return [
+            path
+            for path in self.debug_dir.iterdir()
+            if path.is_file()
+            and _DEBUG_ARTIFACT_NAME.fullmatch(path.name)
+            and path.resolve() not in expected
+        ]
+
+    def reclaimable_storage(self) -> int:
+        """Estimate bytes that maintenance can safely reclaim immediately."""
+
+        summary = self.repository.summary()
+        active_sources = {
+            str(item.get("source_id") or "") for item in summary["documents"]
+        }
+        database_free = sum(
+            self._sqlite_free_bytes(path)
+            for path in (
+                self.db_dir / "chroma.sqlite3",
+                self.lexical_db,
+                self.db_dir / "embedding_cache.sqlite3",
+            )
+        )
+        orphan_segments = sum(
+            directory_size(path) for path in self._orphan_chroma_segments()
+        )
+        stale_debug = sum(
+            directory_size(path)
+            for path in self._stale_debug_artifacts(active_sources)
+        )
+        return database_free + orphan_segments + stale_debug
+
+    def _index_snapshot(self) -> dict[str, Any]:
+        """Read dense, lexical, and manifest identity without loading models."""
+
+        manifest = self.repository._read_json(
+            self.repository.manifest_path,
+            {"sources": {}},
+        )
+        manifest_entries = {
+            str(source_id): entry
+            for source_id, entry in (manifest.get("sources") or {}).items()
+            if isinstance(entry, dict) and entry.get("complete")
+        }
+        manifest_sources = set(manifest_entries)
+        manifest_chunks = sum(
+            int(entry.get("chunk_count") or 0)
+            for entry in manifest_entries.values()
+        )
+
+        dense_database = self.db_dir / "chroma.sqlite3"
+        dense_chunks = 0
+        dense_sources: set[str] = set()
+        if dense_database.is_file():
+            connection = sqlite3.connect(
+                f"file:{dense_database.as_posix()}?mode=ro",
+                uri=True,
+            )
+            try:
+                dense_chunks = int(
+                    connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+                )
+                dense_sources = {
+                    str(row[0])
+                    for row in connection.execute(
+                        """
+                        SELECT DISTINCT string_value
+                        FROM embedding_metadata
+                        WHERE key IN ('source_id', 'source')
+                          AND string_value IS NOT NULL
+                        """
+                    )
+                }
+            finally:
+                connection.close()
+
+        lexical_chunks = 0
+        lexical_sources: set[str] = set()
+        if self.lexical_db.is_file():
+            connection = sqlite3.connect(
+                f"file:{self.lexical_db.as_posix()}?mode=ro",
+                uri=True,
+            )
+            try:
+                lexical_chunks = int(
+                    connection.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+                )
+                lexical_sources = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT DISTINCT source_id FROM chunks_fts"
+                    )
+                }
+            finally:
+                connection.close()
+
+        return {
+            "manifest_chunks": manifest_chunks,
+            "manifest_sources": manifest_sources,
+            "dense_chunks": dense_chunks,
+            "dense_sources": dense_sources,
+            "lexical_chunks": lexical_chunks,
+            "lexical_sources": lexical_sources,
+        }
+
+    def _verify_index_snapshot(self) -> dict[str, Any]:
+        snapshot = self._index_snapshot()
+        counts = {
+            snapshot["manifest_chunks"],
+            snapshot["dense_chunks"],
+            snapshot["lexical_chunks"],
+        }
+        if len(counts) != 1:
+            raise RuntimeError(
+                "Storage optimization requires matching manifest, dense, and "
+                "lexical chunk counts; found "
+                f"{snapshot['manifest_chunks']}, {snapshot['dense_chunks']}, "
+                f"and {snapshot['lexical_chunks']}. Apply index changes first."
+            )
+        if not (
+            snapshot["manifest_sources"]
+            == snapshot["dense_sources"]
+            == snapshot["lexical_sources"]
+        ):
+            raise RuntimeError(
+                "Storage optimization requires matching manifest, dense, and "
+                "lexical source sets. Apply index changes first."
+            )
+        return snapshot
+
+    @staticmethod
+    def _managed_chroma_paths(root: Path) -> list[Path]:
+        if not root.is_dir():
+            return []
+        return [
+            child
+            for child in root.iterdir()
+            if (
+                child.is_file()
+                and child.name.startswith("chroma.sqlite3")
+            )
+            or (
+                child.is_dir()
+                and _CHROMA_SEGMENT_DIRECTORY.fullmatch(child.name)
+                and (child / "header.bin").is_file()
+            )
+        ]
+
+    def _swap_rebuilt_chroma(self, rebuilt_root: Path, rollback_root: Path) -> None:
+        old_paths = self._managed_chroma_paths(self.db_dir)
+        new_paths = self._managed_chroma_paths(rebuilt_root)
+        if not any(path.name == "chroma.sqlite3" for path in new_paths):
+            raise RuntimeError("The rebuilt Chroma index has no database file.")
+
+        moved_old: list[tuple[Path, Path]] = []
+        installed: list[Path] = []
+        try:
+            for old_path in old_paths:
+                rollback_path = rollback_root / old_path.name
+                os.replace(old_path, rollback_path)
+                moved_old.append((old_path, rollback_path))
+            for new_path in new_paths:
+                destination = self.db_dir / new_path.name
+                shutil.move(str(new_path), str(destination))
+                installed.append(destination)
+            self._verify_index_snapshot()
+        except Exception:
+            for installed_path in installed:
+                resolved = installed_path.resolve()
+                if not resolved.is_relative_to(self.db_dir):
+                    continue
+                if installed_path.is_dir():
+                    shutil.rmtree(installed_path)
+                elif installed_path.exists():
+                    installed_path.unlink()
+            for original_path, rollback_path in reversed(moved_old):
+                if rollback_path.exists():
+                    os.replace(rollback_path, original_path)
+            raise
+
+    def _rebuild_chroma_index(self, expected_chunks: int) -> bool:
+        if expected_chunks <= 0 or not (self.db_dir / "chroma.sqlite3").is_file():
+            return False
+
+        import chromadb
+
+        with tempfile.TemporaryDirectory(
+            prefix="reference-desk-optimize-",
+            dir=str(self.db_dir.parent),
+        ) as temporary_name:
+            staging = Path(temporary_name)
+            rebuilt_root = staging / "rebuilt-index"
+            rollback_root = staging / "rollback"
+            rebuilt_root.mkdir()
+            rollback_root.mkdir()
+
+            source_client = chromadb.PersistentClient(path=str(self.db_dir))
+            target_client = chromadb.PersistentClient(path=str(rebuilt_root))
+            try:
+                source = source_client.get_collection(self.collection_name)
+                hnsw = dict((source.configuration or {}).get("hnsw") or {})
+                hnsw.pop("embedding_function", None)
+                target = target_client.create_collection(
+                    name=self.collection_name,
+                    metadata=dict(source.metadata or {}),
+                    configuration={"hnsw": hnsw} if hnsw else None,
+                )
+                batch_size = 250
+                for offset in range(0, expected_chunks, batch_size):
+                    batch = source.get(
+                        limit=batch_size,
+                        offset=offset,
+                        include=["embeddings", "documents", "metadatas"],
+                    )
+                    ids = list(batch.get("ids") or [])
+                    if not ids:
+                        continue
+                    embeddings = batch.get("embeddings")
+                    if hasattr(embeddings, "tolist"):
+                        embeddings = embeddings.tolist()
+                    target.add(
+                        ids=ids,
+                        embeddings=embeddings,
+                        documents=list(batch.get("documents") or []),
+                        metadatas=list(batch.get("metadatas") or []),
+                    )
+                if target.count() != expected_chunks:
+                    raise RuntimeError(
+                        "The rebuilt Chroma index did not preserve every active chunk."
+                    )
+            finally:
+                target_client.close()
+                source_client.close()
+
+            self._swap_rebuilt_chroma(rebuilt_root, rollback_root)
+        return True
+
+    @staticmethod
+    def _vacuum_database(path: Path) -> int:
+        if not path.is_file():
+            return 0
+        before = path.stat().st_size
+        connection = sqlite3.connect(path, timeout=120, isolation_level=None)
+        try:
+            connection.execute("PRAGMA busy_timeout = 120000")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).casefold()
+            if journal_mode == "wal":
+                checkpoint = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if checkpoint and int(checkpoint[0]) != 0:
+                    raise RuntimeError(f"Could not checkpoint {path.name}.")
+            connection.execute("VACUUM")
+            connection.execute("PRAGMA optimize")
+        finally:
+            connection.close()
+        return max(0, before - path.stat().st_size)
+
+    def optimize_storage(self) -> dict[str, Any]:
+        """Back up, rebuild, compact, and verify the active local index."""
+
+        with self._lock:
+            before_snapshot = self._verify_index_snapshot()
+            summary = self.repository.summary()
+            active_sources = {
+                str(item.get("source_id") or "") for item in summary["documents"]
+            }
+            stale_debug = self._stale_debug_artifacts(active_sources)
+            orphan_segments = self._orphan_chroma_segments()
+            before_bytes = directory_size(self.db_dir) + (
+                directory_size(self.debug_dir) if self.debug_dir else 0
+            )
+            backup = self.create_backup("Before storage optimization")
+
+            rebuilt = self._rebuild_chroma_index(
+                int(before_snapshot["manifest_chunks"])
+            )
+            removed_debug = 0
+            for path in stale_debug:
+                path.unlink(missing_ok=True)
+                removed_debug += 1
+
+            compacted: dict[str, int] = {}
+            for database in (
+                self.db_dir / "chroma.sqlite3",
+                self.lexical_db,
+                self.db_dir / "embedding_cache.sqlite3",
+            ):
+                if database.is_file():
+                    compacted[database.name] = self._vacuum_database(database)
+
+            after_snapshot = self._verify_index_snapshot()
+            after_bytes = directory_size(self.db_dir) + (
+                directory_size(self.debug_dir) if self.debug_dir else 0
+            )
+            self.invalidate_health()
+            return {
+                "optimized": True,
+                "backup": backup,
+                "reclaimed_bytes": max(0, before_bytes - after_bytes),
+                "before_bytes": before_bytes,
+                "after_bytes": after_bytes,
+                "dense_index_rebuilt": rebuilt,
+                "orphan_segments_removed": len(orphan_segments),
+                "debug_files_removed": removed_debug,
+                "databases_compacted": compacted,
+                "chunks_verified": int(after_snapshot["manifest_chunks"]),
+                "sources_verified": len(after_snapshot["manifest_sources"]),
+            }
+
     def _document_hash(self, document: dict[str, Any]) -> str:
         source_id = str(document["source_id"])
         path = self.repository.resolve_source(source_id)
@@ -418,6 +837,7 @@ class CorpusScaleManager:
                 "revisions": directory_size(self.repository.revision_dir),
                 "backups": directory_size(self.backup_dir),
                 "debug": directory_size(self.debug_dir) if self.debug_dir else 0,
+                "reclaimable": self.reclaimable_storage(),
             }
             storage["active"] = (
                 storage["documents"] + storage["index"] + storage["workspace"]

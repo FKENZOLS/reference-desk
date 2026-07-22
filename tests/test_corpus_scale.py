@@ -1,10 +1,14 @@
+import json
 import sqlite3
 from pathlib import Path
 
+import chromadb
 import pytest
+from langchain_core.documents import Document
 
-from corpus_scale import CorpusScaleManager
+from corpus_scale import CorpusScaleManager, debug_artifact_paths
 from document_manager import DuplicateDocumentError, DocumentRepository
+from lexical_index import replace_source
 
 
 def repository(tmp_path: Path) -> DocumentRepository:
@@ -158,3 +162,110 @@ def test_backup_and_restore_replace_the_full_corpus_snapshot(tmp_path: Path) -> 
     assert index_file.read_bytes() == b"original-index"
     with sqlite3.connect(workspace) as connection:
         assert connection.execute("SELECT value FROM notes").fetchone()[0] == "original-note"
+
+
+def test_storage_optimization_rebuilds_and_verifies_only_active_index(
+    tmp_path: Path,
+) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(pdf(tmp_path, "manual.part"), "manual.pdf")
+    repo.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    repo.manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "sources": {
+                    "manual.pdf": {
+                        "complete": True,
+                        "chunk_count": 2,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo.clear_pending_sources(("manual.pdf",), ())
+
+    dense_client = chromadb.PersistentClient(path=str(tmp_path / "db"))
+    dense = dense_client.get_or_create_collection(
+        "technical_docs_qwen_v1",
+        metadata={"hnsw:space": "cosine"},
+    )
+    dense.add(
+        ids=["chunk-1", "chunk-2"],
+        embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        documents=["first passage", "second passage"],
+        metadatas=[
+            {"source_id": "manual.pdf"},
+            {"source_id": "manual.pdf"},
+        ],
+    )
+    dense_client.close()
+
+    lexical_documents = [
+        Document(
+            page_content="first passage",
+            metadata={"document_title": "Manual", "source_id": "manual.pdf"},
+        ),
+        Document(
+            page_content="second passage",
+            metadata={"document_title": "Manual", "source_id": "manual.pdf"},
+        ),
+    ]
+    replace_source(
+        path=tmp_path / "db" / "lexical.sqlite3",
+        source_id="manual.pdf",
+        documents=lexical_documents,
+        ids=["chunk-1", "chunk-2"],
+    )
+
+    active_debug, active_chunks = debug_artifact_paths(
+        tmp_path / "debug",
+        "manual.pdf",
+    )
+    active_debug.parent.mkdir(parents=True, exist_ok=True)
+    active_debug.write_text("active", encoding="utf-8")
+    active_chunks.write_text("active", encoding="utf-8")
+    stale_debug, stale_chunks = debug_artifact_paths(
+        tmp_path / "debug",
+        "deleted.pdf",
+    )
+    stale_debug.write_text("stale", encoding="utf-8")
+    stale_chunks.write_text("stale", encoding="utf-8")
+
+    orphan = tmp_path / "db" / "11111111-1111-1111-1111-111111111111"
+    orphan.mkdir()
+    (orphan / "header.bin").write_bytes(b"old")
+    (orphan / "data_level0.bin").write_bytes(b"unused vectors")
+
+    corpus = manager(tmp_path, repo)
+    assert corpus._index_snapshot() == {
+        "manifest_chunks": 2,
+        "manifest_sources": {"manual.pdf"},
+        "dense_chunks": 2,
+        "dense_sources": {"manual.pdf"},
+        "lexical_chunks": 2,
+        "lexical_sources": {"manual.pdf"},
+    }
+    result = corpus.optimize_storage()
+
+    assert result["optimized"] is True
+    assert result["chunks_verified"] == 2
+    assert result["sources_verified"] == 1
+    assert result["dense_index_rebuilt"] is True
+    assert result["orphan_segments_removed"] == 1
+    assert result["debug_files_removed"] == 2
+    assert not orphan.exists()
+    assert active_debug.read_text(encoding="utf-8") == "active"
+    assert active_chunks.read_text(encoding="utf-8") == "active"
+    assert not stale_debug.exists()
+    assert not stale_chunks.exists()
+    assert (tmp_path / "backups" / result["backup"]["filename"]).is_file()
+
+    reopened = chromadb.PersistentClient(path=str(tmp_path / "db"))
+    try:
+        rebuilt = reopened.get_collection("technical_docs_qwen_v1")
+        assert rebuilt.count() == 2
+        assert set(rebuilt.get(include=[])["ids"]) == {"chunk-1", "chunk-2"}
+    finally:
+        reopened.close()

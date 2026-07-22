@@ -192,6 +192,7 @@ export type CorpusStorage = {
   revisions: number
   backups: number
   debug: number
+  reclaimable: number
   active: number
   total: number
 }

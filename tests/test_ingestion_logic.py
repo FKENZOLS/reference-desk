@@ -18,6 +18,7 @@ from ingest import (
     is_cuda_out_of_memory,
     merge_short_chunks,
     missing_extractable_pages,
+    prune_removed_sources,
     recommended_docling_batch_size,
     recommended_docling_threads,
     recommended_page_window,
@@ -33,6 +34,7 @@ from types import SimpleNamespace
 
 import pytest
 import ingest
+from corpus_scale import debug_artifact_paths
 
 
 class FakeRuntime:
@@ -357,6 +359,45 @@ def test_only_unrepresented_source_pages_with_text_require_recovery(
     )
 
     assert missing_extractable_pages(tmp_path / "manual.pdf", records, 4) == [1, 4]
+
+
+def test_pruning_removed_source_also_removes_its_debug_exports(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FakeCollection:
+        deleted = []
+
+        @staticmethod
+        def get(include):
+            return {"metadatas": [{"source_id": "deleted.pdf"}]}
+
+        def delete(self, *, where):
+            self.deleted.append(where)
+
+    markdown, chunks = debug_artifact_paths(tmp_path / "debug", "deleted.pdf")
+    markdown.parent.mkdir(parents=True)
+    markdown.write_text("old", encoding="utf-8")
+    chunks.write_text("old", encoding="utf-8")
+    manifest = {"sources": {"deleted.pdf": {"complete": True}}}
+    lexical_deletions = []
+    monkeypatch.setattr(ingest, "DEBUG_DIR", tmp_path / "debug")
+    monkeypatch.setattr(
+        ingest,
+        "delete_lexical_source",
+        lambda path, source_id: lexical_deletions.append(source_id),
+    )
+    monkeypatch.setattr(ingest, "save_manifest", lambda value: None)
+
+    collection = FakeCollection()
+    removed = prune_removed_sources(collection, manifest, set())
+
+    assert removed == 1
+    assert collection.deleted == [{"source_id": "deleted.pdf"}]
+    assert lexical_deletions == ["deleted.pdf"]
+    assert manifest["sources"] == {}
+    assert not markdown.exists()
+    assert not chunks.exists()
 
 
 def test_embedding_cache_reuses_exact_title_aware_prompt(tmp_path, monkeypatch) -> None:

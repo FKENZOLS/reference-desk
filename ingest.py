@@ -58,6 +58,7 @@ from docling_core.transforms.serializer.markdown import (
 from langchain_core.documents import Document
 from transformers import AutoTokenizer
 
+from corpus_scale import debug_artifact_paths, remove_debug_artifacts
 from hardware import backend_label
 from embedding_cache import EmbeddingCache, embedding_cache_key
 from lexical_index import delete_source as delete_lexical_source
@@ -1616,12 +1617,6 @@ def show_ingestion_timings(
         f"{cache_stats.hits} reused, {cache_stats.misses} computed"
     )
 
-def debug_base_path(source_id: str) -> Path:
-    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(source_id).stem)
-    suffix = hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:10]
-    return DEBUG_DIR / f"{safe_stem}-{suffix}"
-
-
 def export_debug_files(
     source_id: str,
     markdown: str,
@@ -1631,10 +1626,10 @@ def export_debug_files(
         return
 
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    base_path = debug_base_path(source_id)
-    base_path.with_suffix(".md").write_text(markdown, encoding="utf-8")
+    markdown_path, chunks_path = debug_artifact_paths(DEBUG_DIR, source_id)
+    markdown_path.write_text(markdown, encoding="utf-8")
 
-    with base_path.with_suffix(".chunks.jsonl").open(
+    with chunks_path.open(
         "w",
         encoding="utf-8",
     ) as file:
@@ -2337,6 +2332,7 @@ def prune_removed_sources(
         collection.delete(where={"source_id": source_id})
         delete_lexical_source(LEXICAL_DB_PATH, source_id)
         manifest["sources"].pop(source_id, None)
+        remove_debug_artifacts(DEBUG_DIR, source_id)
         print(f"Pruned removed source: {source_id}")
     if removed:
         save_manifest(manifest)

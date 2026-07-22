@@ -37,7 +37,7 @@ every product feature should preserve a route back to the original document.
 | `frontend/src/` | React pages and local shadcn-style presentation components | Retrieval, persistence, or GPU lifecycle |
 | `frontend/dist/` | Checked-in production UI bundle served by FastAPI | Hand-edited source |
 | `document_manager.py` | Safe PDF repository operations and legacy HTML fallback | Chroma ingestion internals |
-| `corpus_scale.py` | Persistent queue state, health/storage, quarantine coordination, backups | Docling conversion or search ranking |
+| `corpus_scale.py` | Persistent queue state, health/storage, quarantine coordination, backups, and verified index compaction | Docling conversion or search ranking |
 | `workspace_store.py` | History, bookmarks, notes, collections, feedback, immutable benchmark versions, experiments, notifications, and schema migrations | Search ranking |
 | `workspace_ui.py` | Legacy research-workspace fallback | SQLite queries |
 | `quality_ui.py` | Legacy quality-dashboard fallback | Threshold fitting or retrieval |
@@ -96,6 +96,12 @@ workspace matters.
    a vector from another model revision.
    Document titles may come only from credible page-one evidence or the source
    filename; inherited headings from later pages are never document metadata.
+10. Storage optimization must run under exclusive search maintenance, create a
+    recovery backup, rebuild into a temporary Chroma directory, verify manifest,
+    dense, and lexical source/count equality before and after the swap, and keep
+    the original managed index paths available for rollback until verification
+    succeeds. Orphan detection alone never authorizes deletion of an active
+    segment.
 8. Workspace data is independent from ingestion and must survive index rebuilds.
 9. Wrong-result labels are hard negatives; only explicit no-result judgments may create unanswerable benchmark cases.
 10. Learned rejection remains inactive until both configured label minimums are met.
@@ -181,6 +187,17 @@ workspace matters.
 6. Quarantine a failed source and continue; a failed commit releases the search
    pause without exposing a partially updated source.
 7. Honor pause requests before beginning the next document.
+
+### Storage optimization
+
+1. Refuse optimization while ingestion or pending document changes exist.
+2. Pause search, release Chroma and reranker handles, and create a corpus backup.
+3. Copy only active IDs, embeddings, documents, and metadata into a temporary
+   Chroma collection using the current collection configuration.
+4. Move the old Chroma-managed paths into a rollback directory, install the
+   rebuilt paths, and restore the originals if the three index invariants fail.
+5. Remove stale deterministic debug exports, vacuum the dense, lexical, and
+   embedding-cache SQLite files, then verify source sets and chunk counts again.
 
 ## Where to make common changes
 
