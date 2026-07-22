@@ -27,6 +27,7 @@ _WINDOWS_RESERVED = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 _PENDING_LIFECYCLE_STATES = {"uploaded", "pending", "processing", "failed"}
+_INCOMPLETE_INDEX_ERROR = "extractable text is still missing from pages"
 _DOCUMENT_LIFECYCLE_STATES = {
     "uploaded",
     "pending",
@@ -187,6 +188,14 @@ class DocumentRepository:
             entry["current_file_hash"] = str(entry.get("current_file_hash") or "")
             entry["error"] = str(entry.get("error") or "")
             entry["index_removal_pending"] = bool(entry.get("index_removal_pending"))
+            entry["allow_incomplete_index"] = bool(
+                entry.get("allow_incomplete_index")
+            )
+            entry["index_warnings"] = [
+                str(warning)
+                for warning in entry.get("index_warnings", [])
+                if warning
+            ][:20]
             entry["updated_at"] = str(entry.get("updated_at") or "")
             entry["history"] = [
                 dict(event)
@@ -240,6 +249,8 @@ class DocumentRepository:
                 "current_file_hash": "",
                 "error": "",
                 "index_removal_pending": False,
+                "allow_incomplete_index": False,
+                "index_warnings": [],
                 "updated_at": now,
                 "history": [],
             },
@@ -491,6 +502,12 @@ class DocumentRepository:
                         "indexed_file_hash": indexed_hash,
                         "state_updated_at": str(lifecycle.get("updated_at") or ""),
                         "state_error": str(lifecycle.get("error") or ""),
+                        "allow_incomplete_index": bool(
+                            lifecycle.get("allow_incomplete_index")
+                        ),
+                        "index_warnings": list(
+                            lifecycle.get("index_warnings") or []
+                        ),
                         "state_history": list(lifecycle.get("history") or []),
                         "revision_count": revision_counts.get(source_id, 0),
                     }
@@ -550,6 +567,10 @@ class DocumentRepository:
                         **record,
                         "quarantine_id": record_path.parent.name,
                         "size": pdf_path.stat().st_size,
+                        "can_index_incomplete": (
+                            _INCOMPLETE_INDEX_ERROR
+                            in str(record.get("error") or "").casefold()
+                        ),
                     }
                 )
             return entries
@@ -594,11 +615,25 @@ class DocumentRepository:
             )
             return {**record, "size": destination.stat().st_size}
 
-    def restore_quarantine(self, quarantine_id: str) -> dict[str, str]:
+    def restore_quarantine(
+        self,
+        quarantine_id: str,
+        *,
+        allow_incomplete_index: bool = False,
+    ) -> dict[str, str | bool]:
         with self._lock:
             entry = self._aux_entry(self.quarantine_dir, quarantine_id)
             record = self._read_json(entry / "record.json", {})
             normalized = self.normalize_source_id(str(record.get("source_id") or ""))
+            if (
+                allow_incomplete_index
+                and _INCOMPLETE_INDEX_ERROR
+                not in str(record.get("error") or "").casefold()
+            ):
+                raise ValueError(
+                    "This failure cannot bypass quarantine because no partial "
+                    "page-coverage index is available."
+                )
             source = entry / "document.pdf"
             target = self.resolve_source(normalized)
             if not source.is_file():
@@ -609,7 +644,53 @@ class DocumentRepository:
             os.replace(source, target)
             shutil.rmtree(entry, ignore_errors=True)
             self._mark_changes(pending=(normalized,), remove_deleted=(normalized,))
-            return {"source_id": normalized}
+            self.set_incomplete_index_override(
+                normalized,
+                allowed=allow_incomplete_index,
+            )
+            return {
+                "source_id": normalized,
+                "allow_incomplete_index": allow_incomplete_index,
+            }
+
+    def set_incomplete_index_override(
+        self,
+        source_id: str,
+        *,
+        allowed: bool,
+    ) -> None:
+        normalized = self.normalize_source_id(source_id)
+        with self._lock:
+            state = self._state()
+            entry = state["documents"].get(normalized)
+            if entry is None:
+                raise FileNotFoundError(normalized)
+            if bool(entry.get("allow_incomplete_index")) != bool(allowed):
+                self._transition_in_state(
+                    state,
+                    normalized,
+                    str(entry.get("status") or "pending"),
+                    reason=(
+                        "User allowed indexing with incomplete page coverage"
+                        if allowed
+                        else "Incomplete-page indexing override disabled"
+                    ),
+                )
+            entry["allow_incomplete_index"] = bool(allowed)
+            entry["index_warnings"] = []
+            self._sync_legacy_views(state)
+            self._write_json(self.state_path, state)
+
+    def allowed_incomplete_sources(self) -> list[str]:
+        with self._lock:
+            state = self._state()
+            return sorted(
+                source_id
+                for source_id, entry in state["documents"].items()
+                if bool(entry.get("allow_incomplete_index"))
+                and str(entry.get("status"))
+                in {"uploaded", "pending", "processing", "indexed"}
+            )
 
     def delete_quarantine(self, quarantine_id: str) -> bool:
         with self._lock:
@@ -661,6 +742,7 @@ class DocumentRepository:
             shutil.copy2(archived, temporary)
             os.replace(temporary, target)
             self._mark_changes(pending=(normalized,), remove_deleted=(normalized,))
+            self.set_incomplete_index_override(normalized, allowed=False)
             return {"source_id": normalized, "revision_id": revision_id}
 
     def summary(self) -> dict[str, Any]:
@@ -721,6 +803,7 @@ class DocumentRepository:
             target.parent.mkdir(parents=True, exist_ok=True)
             os.replace(temporary_path, target)
             self._mark_changes(pending=(normalized,), remove_deleted=(normalized,))
+            self.set_incomplete_index_override(normalized, allowed=False)
             return {
                 "source_id": normalized,
                 "size": target.stat().st_size,
@@ -811,13 +894,18 @@ class DocumentRepository:
             for source_id, entry in list(state["documents"].items()):
                 if str(entry.get("status")) in _PENDING_LIFECYCLE_STATES:
                     manifest_entry = manifest_sources.get(source_id) or {}
-                    self._transition_in_state(
+                    transitioned = self._transition_in_state(
                         state,
                         source_id,
                         "indexed",
                         reason="Index update completed",
                         file_hash=str(manifest_entry.get("file_hash") or ""),
                     )
+                    transitioned["index_warnings"] = [
+                        str(warning)
+                        for warning in manifest_entry.get("index_warnings", [])
+                        if warning
+                    ][:20]
                 entry["index_removal_pending"] = False
             self._sync_legacy_views(state)
             self._write_json(self.state_path, state)
@@ -833,13 +921,18 @@ class DocumentRepository:
             manifest_sources = manifest.get("sources") or {}
             for source_id in sources:
                 manifest_entry = manifest_sources.get(source_id) or {}
-                self._transition_in_state(
+                transitioned = self._transition_in_state(
                     state,
                     source_id,
                     "indexed",
                     reason="Index update completed",
                     file_hash=str(manifest_entry.get("file_hash") or ""),
                 )
+                transitioned["index_warnings"] = [
+                    str(warning)
+                    for warning in manifest_entry.get("index_warnings", [])
+                    if warning
+                ][:20]
             for source_id in deleted:
                 entry = state["documents"].get(source_id)
                 if entry is not None:

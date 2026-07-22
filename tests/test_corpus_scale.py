@@ -115,6 +115,69 @@ def test_failed_document_quarantine_is_recoverable(tmp_path: Path) -> None:
     assert "broken.pdf" in repo.summary()["pending_sources"]
 
 
+def test_page_coverage_quarantine_can_be_explicitly_indexed(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(pdf(tmp_path, "partial.part"), "partial.pdf")
+    quarantined = repo.quarantine(
+        "partial.pdf",
+        "RuntimeError: Refusing to mark the document indexed because "
+        "extractable text is still missing from pages 2.",
+    )
+
+    quarantine = repo.list_quarantine()
+    assert quarantine[0]["can_index_incomplete"] is True
+
+    restored = repo.restore_quarantine(
+        str(quarantined["quarantine_id"]),
+        allow_incomplete_index=True,
+    )
+
+    assert restored["allow_incomplete_index"] is True
+    assert repo.allowed_incomplete_sources() == ["partial.pdf"]
+    document = repo.summary()["documents"][0]
+    assert document["allow_incomplete_index"] is True
+
+    warning = "Indexed by explicit user override; page 2 is missing."
+    file_hash = repo._file_hash(repo.resolve_source("partial.pdf"))
+    repo.manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "sources": {
+                    "partial.pdf": {
+                        "complete": True,
+                        "file_hash": file_hash,
+                        "chunk_count": 0,
+                        "index_warnings": [warning],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo.clear_pending_sources(("partial.pdf",), ())
+
+    indexed = repo.summary()["documents"][0]
+    assert indexed["index_warnings"] == [warning]
+    issues = manager(tmp_path, repo).health(refresh=True)["issues"]
+    assert any(issue["label"] == "Partial document indexes" for issue in issues)
+
+
+def test_non_coverage_quarantine_cannot_bypass_validation(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(pdf(tmp_path, "broken.part"), "broken.pdf")
+    quarantined = repo.quarantine("broken.pdf", "RuntimeError: damaged PDF")
+
+    with pytest.raises(ValueError, match="cannot bypass quarantine"):
+        repo.restore_quarantine(
+            str(quarantined["quarantine_id"]),
+            allow_incomplete_index=True,
+        )
+
+    assert repo.summary()["counts"]["quarantine"] == 1
+    assert not repo.resolve_source("broken.pdf").exists()
+
+
 def test_completed_quarantine_removal_is_reconciled_from_all_indexes(
     tmp_path: Path,
 ) -> None:

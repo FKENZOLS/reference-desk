@@ -859,6 +859,11 @@ class CorpusScaleManager:
                 for item in documents
                 if item.get("pages") is None
             )
+            partial_sources = sorted(
+                str(item["source_id"])
+                for item in documents
+                if item.get("index_warnings")
+            )
             hash_groups: dict[str, list[str]] = {}
             for document in documents:
                 try:
@@ -916,6 +921,7 @@ class CorpusScaleManager:
             for label, values in (
                 ("Quarantined documents", summary["quarantine"]),
                 ("Pending index changes", summary["pending_sources"] + summary["deleted_sources"]),
+                ("Partial document indexes", partial_sources),
                 ("Duplicate document groups", duplicate_groups),
                 ("Stale index entries", stale_sources),
             ):

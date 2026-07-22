@@ -185,7 +185,9 @@ workspace matters.
 5. Before each source replacement or prune, pause new searches, wait for the
    active query lock, then commit Chroma, FTS, and manifest changes together.
 6. Quarantine a failed source and continue; a failed commit releases the search
-   pause without exposing a partially updated source.
+   pause without exposing a partially updated source. A user may explicitly
+   override only the missing-page coverage guard for one source; the manifest,
+   chunk metadata, and document state retain the partial-index warning.
 7. Honor pause requests before beginning the next document.
 
 ### Storage optimization

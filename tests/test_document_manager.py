@@ -431,6 +431,41 @@ def test_storage_optimization_route_requires_current_index_and_pauses_search(
     assert "Apply pending" in blocked.json()["detail"]
 
 
+def test_allow_incomplete_quarantine_route_records_the_override(monkeypatch) -> None:
+    calls = []
+
+    class FakeRepository:
+        @staticmethod
+        def restore_quarantine(quarantine_id, *, allow_incomplete_index=False):
+            calls.append((quarantine_id, allow_incomplete_index))
+            return {
+                "source_id": "partial.pdf",
+                "allow_incomplete_index": allow_incomplete_index,
+            }
+
+    fake_repository = FakeRepository()
+    fake_corpus = SimpleNamespace(
+        repository=fake_repository,
+        invalidate_health=lambda: calls.append("invalidate"),
+    )
+    monkeypatch.setattr(search_app, "DOCUMENT_REPOSITORY", fake_repository)
+    monkeypatch.setattr(search_app, "CORPUS_SCALE", fake_corpus)
+    monkeypatch.setattr(
+        search_app,
+        "_DOCUMENT_JOB",
+        {"running": False, "message": "", "log": []},
+    )
+
+    client = TestClient(search_app.create_web_app(gr.Blocks()))
+    response = client.post(
+        "/documents/api/quarantine/quarantine-1/allow-incomplete"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["allow_incomplete_index"] is True
+    assert calls == [("quarantine-1", True), "invalidate"]
+
+
 def test_successful_background_job_clears_pending_changes(monkeypatch) -> None:
     cleared = []
     fake_repository = SimpleNamespace(clear_pending=lambda: cleared.append(True))
@@ -465,6 +500,7 @@ def test_quarantine_finalization_clears_its_index_removal_marker(
     monkeypatch,
 ) -> None:
     cleared = []
+    launches = []
     process_results = [
         (
             [
@@ -491,6 +527,10 @@ def test_quarantine_finalization_clears_its_index_removal_marker(
 
         def clear_pending_sources(self, sources=(), deleted=()):
             cleared.append((sources, deleted))
+
+        @staticmethod
+        def allowed_incomplete_sources():
+            return ["broken.pdf"]
 
     fake_repository = FakeRepository()
 
@@ -527,7 +567,8 @@ def test_quarantine_finalization_clears_its_index_removal_marker(
         def invalidate_health():
             return None
 
-    def launch(*args, **kwargs):
+    def launch(command, **kwargs):
+        launches.append(list(command))
         lines, exit_code = process_results.pop(0)
         return FakeProcess(lines, exit_code)
 
@@ -547,6 +588,8 @@ def test_quarantine_finalization_clears_its_index_removal_marker(
     search_app._run_document_index_job(False)
 
     assert cleared == [((), ("broken.pdf",))]
+    assert launches[0][-2:] == ["--allow-incomplete-source", "broken.pdf"]
+    assert "--allow-incomplete-source" not in launches[1]
     job = search_app.document_job_snapshot()
     assert job["state"] == "complete_with_failures"
     assert job["running"] is False

@@ -1049,8 +1049,16 @@ def _run_document_index_job(
                 ("--queue-managed", "--queue-control", str(CORPUS_SCALE.state_path))
             )
             prune_command = list(command)
-            for source_id in CORPUS_SCALE.queued_sources():
+            queued_sources = CORPUS_SCALE.queued_sources()
+            allowed_incomplete_sources = (
+                set(DOCUMENT_REPOSITORY.allowed_incomplete_sources())
+                if hasattr(DOCUMENT_REPOSITORY, "allowed_incomplete_sources")
+                else set()
+            )
+            for source_id in queued_sources:
                 command.extend(("--source", source_id))
+                if source_id in allowed_incomplete_sources:
+                    command.extend(("--allow-incomplete-source", source_id))
         if force:
             command.append("--force")
         exclusive_command = list(command)
@@ -5468,7 +5476,9 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         "/documents/api/quarantine/{quarantine_id}/restore",
         include_in_schema=False,
     )
-    def restore_quarantined_document(quarantine_id: str) -> dict[str, str]:
+    def restore_quarantined_document(
+        quarantine_id: str,
+    ) -> dict[str, str | bool]:
         if document_job_snapshot().get("running"):
             raise HTTPException(status_code=409, detail="Index update in progress.")
         try:
@@ -5478,6 +5488,34 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail="Quarantine entry not found.") from error
         except FileExistsError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        CORPUS_SCALE.invalidate_health()
+        return result
+
+    @app.post(
+        "/documents/api/quarantine/{quarantine_id}/allow-incomplete",
+        include_in_schema=False,
+    )
+    def allow_incomplete_quarantined_document(
+        quarantine_id: str,
+    ) -> dict[str, str | bool]:
+        if document_job_snapshot().get("running"):
+            raise HTTPException(status_code=409, detail="Index update in progress.")
+        try:
+            result = DOCUMENT_REPOSITORY.restore_quarantine(
+                quarantine_id,
+                allow_incomplete_index=True,
+            )
+        except DocumentPathError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except FileNotFoundError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="Quarantine entry not found.",
+            ) from error
+        except FileExistsError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         CORPUS_SCALE.invalidate_health()
         return result

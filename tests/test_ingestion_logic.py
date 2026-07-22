@@ -18,6 +18,7 @@ from ingest import (
     is_cuda_out_of_memory,
     merge_short_chunks,
     missing_extractable_pages,
+    page_coverage_warnings,
     prune_removed_sources,
     recommended_docling_batch_size,
     recommended_docling_threads,
@@ -359,6 +360,23 @@ def test_only_unrepresented_source_pages_with_text_require_recovery(
     )
 
     assert missing_extractable_pages(tmp_path / "manual.pdf", records, 4) == [1, 4]
+
+
+def test_page_coverage_requires_an_explicit_per_document_override() -> None:
+    with pytest.raises(RuntimeError, match="missing from pages 2, 7"):
+        page_coverage_warnings(
+            [2, 7],
+            allow_incomplete_index=False,
+        )
+
+    warnings = page_coverage_warnings(
+        [2, 7],
+        allow_incomplete_index=True,
+    )
+
+    assert len(warnings) == 1
+    assert "explicit user override" in warnings[0]
+    assert "pages 2, 7" in warnings[0]
 
 
 def test_pruning_removed_source_also_removes_its_debug_exports(

@@ -84,6 +84,12 @@ tables are analyzed, passages are embedded, and provenance is preserved. The
 queue continues when one PDF fails; an unrecoverable document is quarantined
 instead of stopping every remaining item.
 
+When quarantine was caused only by missing page coverage, **Index anyway** can
+return that PDF to the queue with an explicit per-document override. Apply the
+pending change to index its usable passages. The document remains labeled as a
+partial index, including the missing-page warning. Parser failures and PDFs
+with no usable passages cannot bypass quarantine.
+
 ### Main areas
 
 | Area | Purpose |
@@ -194,6 +200,10 @@ parser on progressively smaller ranges. If one page still cannot be converted,
 PDFium is attempted. A page is never silently omitted: the document is either
 completed or marked failed and quarantined, while the rest of the queue
 continues.
+
+If all conversion retries produced useful passages but the coverage guard still
+finds an omitted text page, expand **Quarantine** and select **Index anyway**.
+Use this only when incomplete search coverage is acceptable for that document.
 
 ---
 

@@ -138,6 +138,8 @@ export type ManagedDocument = {
   indexed_file_hash?: string
   state_updated_at?: string
   state_error?: string
+  allow_incomplete_index?: boolean
+  index_warnings?: string[]
   state_history?: { from: string | null; to: string; at: string; reason?: string; error?: string }[]
 }
 
@@ -150,6 +152,7 @@ export type QuarantinedDocument = {
   error: string
   file_hash: string
   size: number
+  can_index_incomplete?: boolean
 }
 
 export type DocumentRevision = {

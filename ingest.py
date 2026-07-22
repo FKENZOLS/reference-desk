@@ -1960,6 +1960,28 @@ def missing_extractable_pages(
     return sorted(extractable_text_pages(pdf_path, unrepresented_pages))
 
 
+def page_coverage_warnings(
+    missing_pages: Sequence[int],
+    *,
+    allow_incomplete_index: bool,
+) -> list[str]:
+    """Enforce page coverage unless this source has an explicit user override."""
+
+    if not missing_pages:
+        return []
+    preview = ", ".join(str(page) for page in missing_pages[:20])
+    suffix = " ..." if len(missing_pages) > 20 else ""
+    if not allow_incomplete_index:
+        raise RuntimeError(
+            "Refusing to mark the document indexed because extractable text "
+            f"is still missing from pages {preview}{suffix}."
+        )
+    return [
+        "Indexed by explicit user override even though extractable text "
+        f"is missing from pages {preview}{suffix}."
+    ]
+
+
 def emit_ingestion_progress(
     source_id: str,
     message: str,
@@ -1999,6 +2021,7 @@ def process_pdf(
     docling_pdf_path: Path | None = None,
     commit_gate: Path | None = None,
     tuning: IngestionTuning | None = None,
+    allow_incomplete_index: bool = False,
 ) -> ProcessResult:
     process_started = time.perf_counter()
     timings: dict[str, float] = {}
@@ -2010,6 +2033,13 @@ def process_pdf(
         runtime.tokenizer_name,
         ocr_policy,
     )
+    if allow_incomplete_index:
+        current_fingerprint = stable_fingerprint(
+            {
+                "base_ingestion_fingerprint": current_fingerprint,
+                "allow_incomplete_index": True,
+            }
+        )
 
     print(f"\nProcessing: {source_id}")
 
@@ -2192,12 +2222,16 @@ def process_pdf(
         records,
         page_count,
     )
-    if still_missing:
-        preview = ", ".join(str(page) for page in still_missing[:20])
-        suffix = " ..." if len(still_missing) > 20 else ""
-        raise RuntimeError(
-            "Refusing to mark the document indexed because extractable text "
-            f"is still missing from pages {preview}{suffix}."
+    index_warnings = page_coverage_warnings(
+        still_missing,
+        allow_incomplete_index=allow_incomplete_index,
+    )
+    if index_warnings:
+        emit_ingestion_progress(
+            source_id,
+            index_warnings[0],
+            phase="quality_override",
+            page_count=page_count,
         )
 
     records.sort(
@@ -2221,6 +2255,10 @@ def process_pdf(
             tokenizer_name=runtime.tokenizer_name,
             current_ingestion_fingerprint=current_fingerprint,
         )
+        if index_warnings:
+            for document in documents:
+                document.metadata["incomplete_page_coverage"] = True
+                document.metadata["index_warning"] = index_warnings[0]
 
     if not documents:
         print("  No usable chunks were produced.")
@@ -2264,6 +2302,8 @@ def process_pdf(
                 "embedding_fingerprint": embedding_fingerprint(),
                 "chunk_count": len(ids),
                 "ids_fingerprint": ids_fingerprint(ids),
+                "allow_incomplete_index": bool(index_warnings),
+                "index_warnings": index_warnings,
             }
             save_manifest(manifest)
 
@@ -2394,6 +2434,15 @@ def parse_args() -> argparse.Namespace:
         help="Process only this relative source ID. May be repeated.",
     )
     parser.add_argument(
+        "--allow-incomplete-source",
+        action="append",
+        default=[],
+        help=(
+            "Permit one selected source to be indexed with an explicit warning "
+            "when page-coverage validation still fails. May be repeated."
+        ),
+    )
+    parser.add_argument(
         "--queue-managed",
         action="store_true",
         help="Treat --source values as the complete managed queue selection.",
@@ -2480,6 +2529,10 @@ def main() -> None:
     all_pdf_paths = sorted(PDF_DIR.rglob("*.pdf"))
     selected_sources = {
         str(value or "").strip().replace("\\", "/") for value in args.source
+    }
+    allowed_incomplete_sources = {
+        str(value or "").strip().replace("\\", "/")
+        for value in getattr(args, "allow_incomplete_source", [])
     }
     pdf_paths = (
         [
@@ -2628,6 +2681,9 @@ def main() -> None:
                     docling_pdf_path=conversion_path,
                     commit_gate=args.commit_gate,
                     tuning=tuning,
+                    allow_incomplete_index=(
+                        source_id in allowed_incomplete_sources
+                    ),
                 )
 
             if result.status == "unchanged":
