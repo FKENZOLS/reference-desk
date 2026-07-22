@@ -1,4 +1,3 @@
-import { ChevronDown } from "lucide-react"
 import { type KeyboardEvent, useEffect, useId, useMemo, useRef, useState } from "react"
 import { cn } from "@/lib/utils"
 import type { SearchSource } from "@/types"
@@ -135,16 +134,15 @@ export function SearchScopeSelect({
         }}
         onKeyDown={handleKeyDown}
         className={cn(
-          "flex h-10 w-full rounded-lg border border-input bg-background px-3 py-2 pr-9 text-sm outline-none",
+          "flex h-10 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none",
           "placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring",
         )}
       />
-      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
       {open && (
         <ul
           id={listboxId}
           role="listbox"
-          className="absolute z-50 mt-1 max-h-56 w-full overflow-auto rounded-lg border bg-popover p-1 shadow-2xl"
+          className="absolute z-50 m-0 mt-1 max-h-56 w-full list-none overflow-auto rounded-lg border bg-popover p-0 shadow-2xl"
         >
           {filtered.length ? (
             filtered.map((item, index) => (

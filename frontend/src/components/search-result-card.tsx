@@ -1,10 +1,8 @@
-import { BookmarkPlus, Check, Copy, ExternalLink, FileText, Flag, Info, ThumbsDown, ThumbsUp, Undo2 } from "lucide-react"
 import { useState } from "react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
 import { api, jsonRequest } from "@/lib/api"
 import type { SearchResult } from "@/types"
 
@@ -13,34 +11,11 @@ const copyText = async (value: string, message: string) => {
   toast.success(message)
 }
 
-export function SearchResultCard({ result, showDebug = false, selected = false, onSelected }: { result: SearchResult; showDebug?: boolean; selected?: boolean; onSelected?: (selected: boolean) => void }) {
+export function SearchResultCard({ result, showDebug = false }: { result: SearchResult; showDebug?: boolean }) {
   const [saved, setSaved] = useState(false)
-  const [judgment, setJudgment] = useState<string>("")
-  const [reason, setReason] = useState("")
+  const [judgment, setJudgment] = useState<"relevant" | "wrong_passage" | null>(null)
   const [feedbackId, setFeedbackId] = useState<number | null>(null)
-
-  async function sendFeedback(next: "relevant" | "wrong_passage" | "wrong_document") {
-    try {
-      const response = await api<{ feedback: { id: number } }>("/quality/api/feedback", jsonRequest("POST", { ...result.feedback, judgment: next, reason }))
-      setJudgment(next)
-      setFeedbackId(response.feedback.id)
-      toast.success("Feedback saved")
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not save feedback")
-    }
-  }
-
-  async function undoFeedback() {
-    if (!feedbackId) return
-    try {
-      await api(`/quality/api/feedback/${feedbackId}`, { method: "DELETE" })
-      setJudgment("")
-      setFeedbackId(null)
-      toast.success("Feedback removed")
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not undo feedback")
-    }
-  }
+  const [savingFeedback, setSavingFeedback] = useState(false)
 
   async function savePassage() {
     try {
@@ -65,17 +40,39 @@ export function SearchResultCard({ result, showDebug = false, selected = false, 
     }
   }
 
+  async function toggleFeedback(nextJudgment: "relevant" | "wrong_passage") {
+    setSavingFeedback(true)
+    try {
+      if (judgment === nextJudgment && feedbackId !== null) {
+        await api(`/quality/api/feedback/${feedbackId}`, { method: "DELETE" })
+        setJudgment(null)
+        setFeedbackId(null)
+        toast.success("Quality feedback removed")
+        return
+      }
+
+      const response = await api<{ feedback: { id: number } }>(
+        "/quality/api/feedback",
+        jsonRequest("POST", { ...result.feedback, judgment: nextJudgment }),
+      )
+      setJudgment(nextJudgment)
+      setFeedbackId(response.feedback.id)
+      toast.success("Quality feedback saved")
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not save quality feedback")
+    } finally {
+      setSavingFeedback(false)
+    }
+  }
+
   return (
     <Card className="animate-in overflow-hidden bg-card/85">
       <CardContent className="p-0">
         <div className="flex gap-4 p-5 md:p-6">
-          <div className="hidden size-9 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary sm:grid">
-            <FileText className="size-4" />
-          </div>
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0">
-                <div className="flex items-center gap-2">{onSelected && <input type="checkbox" checked={selected} onChange={(event) => onSelected(event.target.checked)} aria-label={`Select ${result.document_title}`} className="size-4 accent-primary" />}<p className="m-0 truncate font-semibold">{result.document_title}</p></div>
+                <p className="m-0 truncate font-semibold">{result.document_title}</p>
                 <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
                   {result.section && <span>{result.section}</span>}
                   {result.page_label && <><span aria-hidden>·</span><span>{result.page_label}</span></>}
@@ -85,10 +82,6 @@ export function SearchResultCard({ result, showDebug = false, selected = false, 
               <Badge variant="secondary">#{result.result_rank}</Badge>
             </div>
             <p className="mt-5 whitespace-pre-wrap text-[15px] leading-7 text-foreground/90">{result.excerpt}</p>
-            <details className="mt-4 rounded-lg border bg-background/35 px-3 py-2 text-xs text-muted-foreground">
-              <summary className="flex cursor-pointer list-none items-center gap-2 font-medium text-foreground/80"><Info className="size-3.5" /> Why this result</summary>
-              <p className="mb-0 mt-2">Found by {result.explanation.found_by}. Fusion position {result.explanation.fusion_position ?? "—"}; reranker position {result.explanation.reranker_position ?? "—"}. {result.explanation.selected_because}.</p>
-            </details>
             {showDebug && (
               <div className="mt-4 grid grid-cols-2 gap-2 rounded-lg border bg-background/45 p-3 text-xs sm:grid-cols-4">
                 <div><span className="text-muted-foreground">Dense rank</span><p className="m-0 mt-1 font-medium tabular-nums">{result.dense_rank ?? "—"}</p></div>
@@ -103,24 +96,37 @@ export function SearchResultCard({ result, showDebug = false, selected = false, 
             )}
             <div className="mt-5 flex flex-wrap items-center gap-2">
               {result.citation_url && (
-                <Button asChild size="sm"><a href={result.citation_url}><ExternalLink /> Open source</a></Button>
+                <Button asChild size="sm"><a href={result.citation_url}>Open source</a></Button>
               )}
-              <Button size="sm" variant="outline" onClick={() => copyText(result.citation_label, "Citation copied")}><Copy /> Citation</Button>
-              <Button size="sm" variant="outline" onClick={() => copyText(result.excerpt, "Passage copied")}><Copy /> Passage</Button>
-              <Button size="sm" variant="ghost" onClick={savePassage} disabled={saved}>{saved ? <Check /> : <BookmarkPlus />}{saved ? "Saved" : "Save"}</Button>
+              <Button size="sm" variant="outline" onClick={() => copyText(result.citation_label, "Citation copied")}>Citation</Button>
+              <Button size="sm" variant="outline" onClick={() => copyText(result.excerpt, "Passage copied")}>Passage</Button>
+              <Button size="sm" variant="ghost" onClick={savePassage} disabled={saved}>{saved ? "Saved" : "Save"}</Button>
+              <Button
+                size="sm"
+                variant={judgment === "relevant" ? "secondary" : "ghost"}
+                className="ml-2 w-9 px-2"
+                aria-label="Mark result relevant"
+                aria-pressed={judgment === "relevant"}
+                title="Relevant"
+                disabled={savingFeedback}
+                onClick={() => toggleFeedback("relevant")}
+              >
+                👍
+              </Button>
+              <Button
+                size="sm"
+                variant={judgment === "wrong_passage" ? "secondary" : "ghost"}
+                className="w-9 px-2"
+                aria-label="Mark result not relevant"
+                aria-pressed={judgment === "wrong_passage"}
+                title="Not relevant"
+                disabled={savingFeedback}
+                onClick={() => toggleFeedback("wrong_passage")}
+              >
+                👎
+              </Button>
             </div>
           </div>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t bg-muted/25 px-5 py-3 md:px-6">
-          <div className="flex flex-1 flex-wrap items-center gap-1 text-xs text-muted-foreground">
-            <span className="mr-1">Useful?</span>
-            <Button size="sm" variant={judgment === "relevant" ? "secondary" : "ghost"} onClick={() => sendFeedback("relevant")}><ThumbsUp /> Relevant</Button>
-            <Button size="sm" variant={judgment === "wrong_passage" ? "secondary" : "ghost"} onClick={() => sendFeedback("wrong_passage")}><ThumbsDown /> Passage</Button>
-            <Button size="sm" variant={judgment === "wrong_document" ? "secondary" : "ghost"} onClick={() => sendFeedback("wrong_document")}><Flag /> Document</Button>
-            {feedbackId && <Button size="sm" variant="ghost" onClick={undoFeedback}><Undo2 /> Undo</Button>}
-            <Input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Optional: explain why" className="ml-1 h-8 min-w-48 flex-1 text-xs" />
-          </div>
-          <span className="text-[11px] tabular-nums text-muted-foreground">score {result.rerank_probability.toFixed(3)}</span>
         </div>
       </CardContent>
     </Card>

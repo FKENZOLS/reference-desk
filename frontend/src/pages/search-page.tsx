@@ -1,4 +1,3 @@
-import { ChevronDown, CircleAlert, Filter, Flag, LoaderCircle, RefreshCw, Search, SlidersHorizontal, ThumbsDown, ThumbsUp } from "lucide-react"
 import { type FormEvent, useEffect, useState } from "react"
 import { toast } from "sonner"
 import { EmptyState } from "@/components/empty-state"
@@ -30,10 +29,6 @@ export function SearchPage() {
   const [showMore, setShowMore] = useState(false)
   const [withinResults, setWithinResults] = useState(false)
   const [showDebug, setShowDebug] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  const [expectedSource, setExpectedSource] = useState("")
-  const [expectedPage, setExpectedPage] = useState("")
-  const [feedbackReason, setFeedbackReason] = useState("")
 
   useEffect(() => {
     api<{ sources: SearchSource[] }>("/api/sources")
@@ -82,63 +77,10 @@ export function SearchPage() {
         reranker_choice: reranker,
       }))
       setResponse(value)
-      setSelectedIds(new Set())
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Search failed")
     } finally {
       setLoading(false)
-    }
-  }
-
-  async function markAmbiguous() {
-    if (!response) return
-    try {
-      await api("/quality/api/feedback", jsonRequest("POST", { ...response.query_feedback, judgment: "ambiguous", reason: feedbackReason }))
-      toast.success("Question marked as ambiguous")
-    } catch (error) { toast.error(error instanceof Error ? error.message : "Could not save feedback") }
-  }
-
-  async function addExpectedPassage() {
-    if (!response || !expectedSource.trim() || !Number(expectedPage)) return
-    try {
-      await api("/quality/api/feedback", jsonRequest("POST", {
-        ...response.query_feedback,
-        judgment: "expected_passage",
-        expected_source_id: expectedSource.trim(),
-        expected_page: Number(expectedPage),
-        reason: feedbackReason,
-      }))
-      toast.success("Expected passage added to the benchmark")
-      setExpectedSource("")
-      setExpectedPage("")
-    } catch (error) { toast.error(error instanceof Error ? error.message : "Could not save expected passage") }
-  }
-
-  async function labelSelected(judgment: "relevant" | "wrong_passage") {
-    if (!response || !selectedIds.size) return
-    const results = [...response.results, ...response.additional_results].filter((item) => selectedIds.has(item.chunk_id))
-    try {
-      await Promise.all(results.map((result) => api("/quality/api/feedback", jsonRequest("POST", { ...result.feedback, judgment, reason: feedbackReason }))))
-      toast.success(`${results.length} passages labeled`)
-      setSelectedIds(new Set())
-    } catch (error) { toast.error(error instanceof Error ? error.message : "Could not label selected passages") }
-  }
-
-  function selectResult(chunkId: string, selected: boolean) {
-    setSelectedIds((current) => {
-      const next = new Set(current)
-      if (selected) next.add(chunkId); else next.delete(chunkId)
-      return next
-    })
-  }
-
-  async function noRelevantResult() {
-    if (!response) return
-    try {
-      await api("/quality/api/feedback", jsonRequest("POST", { ...response.query_feedback, judgment: "no_relevant_result" }))
-      toast.success("Search marked for review")
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not save feedback")
     }
   }
 
@@ -168,12 +110,12 @@ export function SearchPage() {
                 <Input id="search-query" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find a definition, requirement, table, or passage…" className="h-10" />
               </div>
               <Button type="submit" disabled={loading || !query.trim() || Boolean(rerankerStatus?.restart_required)} className="h-10 px-6">
-                {loading ? <LoaderCircle className="animate-spin" /> : <Search />} Search
+                {loading ? "Searching…" : "Search"}
               </Button>
             </div>
             <details className="group mt-4 border-t pt-4">
               <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-muted-foreground hover:text-foreground">
-                <SlidersHorizontal className="size-3.5" /> Filters and search within results <ChevronDown className="ml-auto size-3.5 transition-transform group-open:rotate-180" />
+                Filters and search within results
               </summary>
               <div className="mt-4 grid gap-3 md:grid-cols-4">
                 <div>
@@ -197,10 +139,10 @@ export function SearchPage() {
                   {rerankerStatus && (
                     <div className="mt-1.5 flex items-center gap-2">
                       <p className={`m-0 text-[11px] ${rerankerStatus.restart_required || rerankerStatus.status === "failed" ? "text-destructive" : "text-muted-foreground"}`}>
-                        {rerankerStatus.status === "loading" && <LoaderCircle className="mr-1 inline size-3 animate-spin" />}
+                        {rerankerStatus.status === "loading" && "Loading · "}
                         {rerankerStatus.message}{rerankerStatus.status === "ready" && rerankerStatus.device ? ` · ${rerankerStatus.device}` : ""}{rerankerStatus.worker_pid ? ` · worker ${rerankerStatus.worker_pid}` : ""}
                       </p>
-                      {(rerankerStatus.status === "failed" || rerankerStatus.restart_required) && <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => void restartWorker()}><RefreshCw className="size-3" /> Restart</Button>}
+                      {(rerankerStatus.status === "failed" || rerankerStatus.restart_required) && <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => void restartWorker()}>Restart</Button>}
                     </div>
                   )}
                 </div>
@@ -218,37 +160,30 @@ export function SearchPage() {
       {loading && <div className="mt-6 space-y-3"><p className="m-0 text-center text-sm text-muted-foreground">{rerankerStatus?.status === "loading" ? rerankerStatus.message : `Searching and reranking with ${rerankers.find((item) => item.value === reranker)?.label || reranker.toUpperCase()}…`}</p><Skeleton className="h-56 w-full" /><Skeleton className="h-56 w-full" /></div>}
 
       {!loading && !response && (
-        <div className="mt-6"><EmptyState icon={Search} title="Search your reference library" detail="Results open directly at the cited page and highlighted source region." /></div>
+        <div className="mt-6"><EmptyState title="Search your reference library" detail="Results open directly at the cited page and highlighted source region." /></div>
       )}
 
       {!loading && response && (
         <section className="mt-7">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="mb-4 flex flex-wrap items-center gap-3">
             <div>
               <h2 className="m-0 text-base font-semibold">{response.results.length ? `${response.results.length} best matches` : "No strong match"}</h2>
               <p className="mt-1 text-xs text-muted-foreground">{response.metrics.total_seconds.toFixed(2)} seconds · {response.metrics.considered_count} passages considered · {response.reranker.label} reranker</p>
               {showDebug && <><p className="mb-0 mt-1 text-[11px] text-muted-foreground">dense {response.metrics.dense_seconds.toFixed(3)}s · lexical {response.metrics.lexical_seconds.toFixed(3)}s · rerank {response.metrics.rerank_seconds.toFixed(3)}s · model load {response.metrics.model_load_seconds.toFixed(3)}s · {response.metrics.reranker_device}</p>{response.metrics.retrieval_plan && <p className="mb-0 mt-1 text-[11px] text-muted-foreground">plan {response.metrics.retrieval_plan.strategy} · dense {response.metrics.retrieval_plan.dense_candidates} · lexical {response.metrics.retrieval_plan.lexical_candidates} · rerank {response.metrics.retrieval_plan.rerank_candidates} · confidence {(response.metrics.retrieval_plan.fusion_confidence * 100).toFixed(0)}% · {response.metrics.retrieval_plan.signals.join(", ")}</p>}</>}
             </div>
-            <div className="flex flex-wrap gap-1"><Button size="sm" variant="ghost" onClick={markAmbiguous}><Flag /> Ambiguous question</Button><Button size="sm" variant="ghost" onClick={noRelevantResult}><CircleAlert /> No relevant result</Button></div>
           </div>
-          {!!Object.keys(response.metrics.hidden_reasons ?? {}).length && <p className="mb-4 text-xs text-muted-foreground">Hidden results: {Object.entries(response.metrics.hidden_reasons ?? {}).map(([reason, count]) => `${count} ${reason.toLowerCase()}`).join(" · ")}</p>}
           {response.gate.no_strong_evidence && (
-            <div className="mb-4 flex items-center gap-2 rounded-lg border border-amber-400/20 bg-amber-400/5 px-4 py-3 text-sm text-amber-100"><CircleAlert className="size-4" /> No passage cleared the calibrated relevance threshold.</div>
+            <div className="mb-4 rounded-lg border border-amber-400/20 bg-amber-400/5 px-4 py-3 text-sm text-amber-100">No passage cleared the calibrated relevance threshold.</div>
           )}
-          <details className="mb-4 rounded-xl border bg-card/55 p-4">
-            <summary className="cursor-pointer text-sm font-medium">The correct passage is missing</summary>
-            <div className="expected-passage-grid mt-3 grid gap-3 md:items-end"><div><Label htmlFor="expected-source">Document path or ID</Label><Input id="expected-source" value={expectedSource} onChange={(event) => setExpectedSource(event.target.value)} placeholder="standards/example.pdf" /></div><div><Label htmlFor="expected-page">Page</Label><Input id="expected-page" type="number" min={1} value={expectedPage} onChange={(event) => setExpectedPage(event.target.value)} /></div><div><Label htmlFor="feedback-reason">Why / notes</Label><Input id="feedback-reason" value={feedbackReason} onChange={(event) => setFeedbackReason(event.target.value)} placeholder="Optional explanation" /></div><Button onClick={addExpectedPassage} disabled={!expectedSource.trim() || !Number(expectedPage)}>Add expected page</Button></div>
-          </details>
-          {!!selectedIds.size && <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-primary/25 bg-primary/5 px-4 py-3 text-sm"><strong>{selectedIds.size} selected</strong><Button size="sm" variant="secondary" onClick={() => labelSelected("relevant")}><ThumbsUp /> Mark relevant</Button><Button size="sm" variant="secondary" onClick={() => labelSelected("wrong_passage")}><ThumbsDown /> Mark wrong passage</Button><Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>Clear</Button></div>}
           {response.results.length ? (
-            <div className="space-y-4">{response.results.map((result) => <SearchResultCard key={result.chunk_id} result={result} showDebug={showDebug} selected={selectedIds.has(result.chunk_id)} onSelected={(selected) => selectResult(result.chunk_id, selected)} />)}</div>
+            <div className="space-y-4">{response.results.map((result) => <SearchResultCard key={result.chunk_id} result={result} showDebug={showDebug} />)}</div>
           ) : (
-            <EmptyState icon={Filter} title="No matching passages" detail="Try a broader query, remove a filter, or inspect the additional reranked passages." />
+            <EmptyState title="No matching passages" detail="Try a broader query, remove a filter, or inspect the additional reranked passages." />
           )}
           {!!response.additional_results.length && (
             <div className="mt-5">
               <Button variant="secondary" onClick={() => setShowMore((value) => !value)}>{showMore ? "Hide" : "Show"} {response.additional_results.length} more reranked sources</Button>
-              {showMore && <div className="mt-4 space-y-4">{response.additional_results.map((result) => <SearchResultCard key={result.chunk_id} result={result} showDebug={showDebug} selected={selectedIds.has(result.chunk_id)} onSelected={(selected) => selectResult(result.chunk_id, selected)} />)}</div>}
+              {showMore && <div className="mt-4 space-y-4">{response.additional_results.map((result) => <SearchResultCard key={result.chunk_id} result={result} showDebug={showDebug} />)}</div>}
             </div>
           )}
         </section>

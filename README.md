@@ -27,7 +27,6 @@ uploaded to GitHub.
 - Check corpus health, storage use, duplicates, and document revisions.
 - Compare retrieval configurations in a saved evaluation workbench.
 - Recover from CUDA reranker failures without restarting the whole app.
-- Explain why each result was shown or hidden and collect richer quality labels.
 - Export a privacy-safe diagnostic ZIP without PDFs, queries, or excerpts.
 
 ## Computer requirements
@@ -123,17 +122,11 @@ The search page reports model loading, worker identity, and device health.
 Enable **Show
 retrieval diagnostics** to inspect dense, lexical, fusion, reranker, token,
 truncation, timing, and adaptive candidate-allocation data for each result.
-Expand **Why this result** to see which retrieval lanes found the passage, its
-fusion and reranker positions, and why it survived relevance and diversity
-filters. The results header summarizes why other candidates were hidden.
+The default Search interface stays focused on the passages and source actions.
+Detailed retrieval diagnostics remain available through the filters panel.
 
-Select several result checkboxes to label them together. Quality feedback can
-also name an expected document page when the correct passage is missing, add
-an optional reason, undo a label, or mark a question as ambiguous. Ambiguous
-queries are excluded from benchmarks; incorrect displayed passages become
-hard negatives.
-
-Open **Experiments** to import a JSONL benchmark or use complete cases built
+Open the collapsed **Advanced** section at the bottom of the sidebar to reach
+**Quality** and **Experiments**. Experiments can import a JSONL benchmark or use complete cases built
 from relevance feedback. You can compare GTE and BGE on the same candidate
 pool, vary candidate count, reranker weight, and passage mode, then save the
 results. Selecting **Use in production** applies that completed experiment's
