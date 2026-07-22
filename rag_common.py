@@ -17,7 +17,6 @@ from langchain_core.embeddings import Embeddings
 from hardware import (
     accelerator_info,
     configured_accelerator,
-    resolve_accelerator,
     torch_device_for,
 )
 
@@ -45,18 +44,24 @@ EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 # PyTorch ROCm intentionally uses the same ``torch.cuda`` device strings as
 # NVIDIA CUDA. Keep the vendor backend separate from the physical device name.
 REQUESTED_ACCELERATOR = configured_accelerator()
-# The setup/doctor workflow validates explicit profiles. Defer importing
-# PyTorch when the installed profile already names its backend; auto detection
-# still resolves eagerly because no portable choice has been recorded yet.
-COMPUTE_BACKEND = (
-    "cuda"
-    if REQUESTED_ACCELERATOR == "auto" and shutil.which("nvidia-smi")
-    else (
-        resolve_accelerator(REQUESTED_ACCELERATOR)
-        if REQUESTED_ACCELERATOR == "auto"
-        else REQUESTED_ACCELERATOR
-    )
-)
+
+
+def bootstrap_compute_backend(requested: str) -> str:
+    """Choose a startup backend without importing the large PyTorch package."""
+
+    if requested != "auto":
+        return requested
+    if shutil.which("nvidia-smi"):
+        return "cuda"
+    if shutil.which("rocminfo") or shutil.which("rocm-smi"):
+        return "rocm"
+    return "cpu"
+
+
+# The setup workflow records an explicit, validated profile. A legacy checkout
+# without that profile uses inexpensive driver-tool hints and lets the lazy
+# hardware diagnostic perform the authoritative PyTorch check only when needed.
+COMPUTE_BACKEND = bootstrap_compute_backend(REQUESTED_ACCELERATOR)
 COMPUTE_DEVICE = torch_device_for(COMPUTE_BACKEND)
 
 

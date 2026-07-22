@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 import main as main_module
+import rag_common
 from main import PROJECT_DIR, command_for, main
 
 
@@ -57,3 +58,9 @@ def test_web_bootstrap_does_not_import_search_engines() -> None:
         "langchain_chroma": False,
         "gradio": False,
     }
+
+
+def test_auto_bootstrap_uses_cpu_without_gpu_driver_tools(monkeypatch) -> None:
+    monkeypatch.setattr(rag_common.shutil, "which", lambda _name: None)
+
+    assert rag_common.bootstrap_compute_backend("auto") == "cpu"
