@@ -151,6 +151,22 @@ the rest of the queue. Each PDF now has one explicit lifecycle—uploaded,
 pending, processing, indexed, failed, or quarantined—with its indexed hash and
 transition history visible from the Documents table.
 
+Ingestion uses quality-preserving adaptive performance settings. It begins with
+12-page conversion windows and recursively retries allocation failures with the
+same accurate parser on smaller ranges. Docling model batches remain at 2 on
+GPUs below 8 GB, rise to 3 or 4 only on larger accelerators, and preprocessing
+uses at most four CPU threads. The exact title-aware Qwen document prompt is
+cached with the embedding-model digest, so later metadata or chunking reindexes
+can reuse unchanged vectors without accepting stale embeddings. Every completed
+document prints conversion, chunking, postprocessing, embedding, indexing, total
+time, pages per second, and embedding-cache hits.
+
+The automatic values can be overridden with `RAG_PDF_PAGE_WINDOW`,
+`RAG_DOCLING_PAGE_BATCH_SIZE`, `RAG_DOCLING_MODEL_BATCH_SIZE`, and
+`RAG_DOCLING_NUM_THREADS`. Set `RAG_EMBEDDING_CACHE=0` only when diagnosing the
+cache; disabling it does not change retrieval quality, but makes reindexing
+slower.
+
 The bell in the lower-right corner keeps persistent updates for model loading,
 indexing, worker restarts, backups, and experiments. **Export diagnostics** on
 the Documents page creates a support ZIP containing only sanitized settings,

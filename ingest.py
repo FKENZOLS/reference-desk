@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import unicodedata
@@ -57,6 +58,7 @@ from langchain_core.documents import Document
 from transformers import AutoTokenizer
 
 from hardware import backend_label
+from embedding_cache import EmbeddingCache, embedding_cache_key
 from lexical_index import delete_source as delete_lexical_source
 from lexical_index import count_chunks as count_lexical_chunks
 from lexical_index import fingerprint_ids as fingerprint_lexical_ids
@@ -75,6 +77,7 @@ from rag_common import (
     MANIFEST_PATH,
     PDF_DIR,
     create_embeddings,
+    document_embedding_input,
     embedding_fingerprint,
     resolved_embedding_revision,
     stable_fingerprint,
@@ -111,19 +114,53 @@ RETRIEVAL_CHILD_OVERLAP_TOKENS = int(
     os.environ.get("RAG_RETRIEVAL_CHILD_OVERLAP_TOKENS", "40")
 )
 
-# Large PDFs are converted in independent page windows so Docling never needs
-# to retain hundreds of rendered pages in the native preprocessing pipeline.
-PDF_PAGE_WINDOW = int(os.environ.get("RAG_PDF_PAGE_WINDOW", "6"))
+# Large PDFs start with a wider window to reduce converter-call overhead. The
+# resilient converter halves allocation failures until the same primary parser
+# succeeds, so complex pages retain the conservative behavior automatically.
+PDF_PAGE_WINDOW = int(os.environ.get("RAG_PDF_PAGE_WINDOW", "12"))
+
+
+def recommended_docling_threads(cpu_count: int | None = None) -> int:
+    """Use modest CPU parallelism without multiplying native-memory pressure."""
+
+    available = max(1, int(cpu_count or os.cpu_count() or 1))
+    return max(2, min(4, available // 2))
+
+
+def recommended_docling_batch_size(total_memory_mb: int | None) -> int:
+    """Select a quality-neutral model batch from total accelerator memory."""
+
+    if total_memory_mb is None or total_memory_mb < 8_192:
+        return 2
+    if total_memory_mb < 12_288:
+        return 3
+    return 4
+
+
+def detected_accelerator_memory_mb() -> int | None:
+    if not DOCLING_DEVICE.startswith("cuda") or not torch.cuda.is_available():
+        return None
+    try:
+        return int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
+    except Exception:
+        return None
+
+
+_AUTO_DOCLING_BATCH_SIZE = recommended_docling_batch_size(
+    detected_accelerator_memory_mb()
+)
 DOCLING_PAGE_BATCH_SIZE = int(
-    os.environ.get("RAG_DOCLING_PAGE_BATCH_SIZE", "2")
+    os.environ.get("RAG_DOCLING_PAGE_BATCH_SIZE", str(_AUTO_DOCLING_BATCH_SIZE))
 )
 DOCLING_QUEUE_MAX_SIZE = int(
     os.environ.get("RAG_DOCLING_QUEUE_MAX_SIZE", "16")
 )
 DOCLING_MODEL_BATCH_SIZE = int(
-    os.environ.get("RAG_DOCLING_MODEL_BATCH_SIZE", "2")
+    os.environ.get("RAG_DOCLING_MODEL_BATCH_SIZE", str(_AUTO_DOCLING_BATCH_SIZE))
 )
-DOCLING_NUM_THREADS = int(os.environ.get("RAG_DOCLING_NUM_THREADS", "2"))
+DOCLING_NUM_THREADS = int(
+    os.environ.get("RAG_DOCLING_NUM_THREADS", str(recommended_docling_threads()))
+)
 # The CUDA-prefixed settings remain accepted for compatibility with existing
 # installations. ROCm exposes memory through the same torch.cuda API.
 CUDA_HEADROOM_WARNING_MB = int(
@@ -145,6 +182,10 @@ ENABLE_TABLE_STRUCTURE = True
 TABLE_MODE = TableFormerMode.ACCURATE
 
 BATCH_SIZE = 64
+EMBEDDING_CACHE_ENABLED = os.environ.get("RAG_EMBEDDING_CACHE", "1") != "0"
+EMBEDDING_CACHE_PATH = Path(
+    os.environ.get("RAG_EMBEDDING_CACHE_PATH", str(DB_DIR / "embedding_cache.sqlite3"))
+).resolve()
 SKIP_UNCHANGED_FILES = True
 EXPORT_DEBUG_FILES = True
 INDEX_COMMIT_WAIT_SECONDS = 120
@@ -254,6 +295,19 @@ def is_gpu_out_of_memory(message: str | None) -> bool:
     return (
         "out of memory" in normalized
         or "hsa_status_error_out_of_resources" in normalized
+    )
+
+
+def is_memory_allocation_failure(message: str | None) -> bool:
+    normalized = (message or "").lower()
+    return is_gpu_out_of_memory(normalized) or any(
+        marker in normalized
+        for marker in (
+            "std::bad_alloc",
+            "cannot allocate memory",
+            "memoryerror",
+            "out of resources",
+        )
     )
 
 
@@ -1244,13 +1298,20 @@ def source_is_current(
     )
 
 
-def embed_documents_in_batches(
+@dataclass
+class EmbeddingCacheStats:
+    hits: int = 0
+    misses: int = 0
+
+
+def _embed_document_positions(
     documents: list[Document],
     embeddings: Any,
+    positions: Sequence[int],
 ) -> list[list[float]]:
     vectors: list[list[float]] = []
-    for document_batch in batched(documents, BATCH_SIZE):
-        batch = list(document_batch)
+    for position_batch in batched(positions, BATCH_SIZE):
+        batch = [documents[position] for position in position_batch]
         vectors.extend(
             embeddings.embed_documents_with_titles(
                 [document.page_content for document in batch],
@@ -1258,6 +1319,81 @@ def embed_documents_in_batches(
             )
         )
     return vectors
+
+
+def embed_documents_in_batches(
+    documents: list[Document],
+    embeddings: Any,
+    *,
+    cache_path: Path | None = EMBEDDING_CACHE_PATH,
+    stats: EmbeddingCacheStats | None = None,
+) -> list[list[float]]:
+    """Embed documents while reusing vectors for the exact model prompt."""
+
+    cache_stats = stats if stats is not None else EmbeddingCacheStats()
+    if not documents:
+        return []
+    if not EMBEDDING_CACHE_ENABLED or cache_path is None:
+        cache_stats.misses += len(documents)
+        return _embed_document_positions(
+            documents,
+            embeddings,
+            list(range(len(documents))),
+        )
+
+    fingerprint = embedding_fingerprint()
+    prompted = [
+        document_embedding_input(
+            document.page_content,
+            document.metadata.get("document_title"),
+        )
+        for document in documents
+    ]
+    keys = [embedding_cache_key(fingerprint, value) for value in prompted]
+    vectors: list[list[float] | None] = [None] * len(documents)
+    try:
+        with EmbeddingCache(cache_path, fingerprint) as cache:
+            cache.prune_other_fingerprints()
+            cached: dict[str, list[float]] = {}
+            for key_batch in batched(keys, BATCH_SIZE):
+                cached.update(cache.get_many(list(key_batch)))
+            missing_positions: list[int] = []
+            for position, cache_key in enumerate(keys):
+                vector = cached.get(cache_key)
+                if vector is None:
+                    missing_positions.append(position)
+                else:
+                    vectors[position] = vector
+
+            cache_stats.hits += len(documents) - len(missing_positions)
+            cache_stats.misses += len(missing_positions)
+            for position_batch in batched(missing_positions, BATCH_SIZE):
+                positions = list(position_batch)
+                fresh = _embed_document_positions(documents, embeddings, positions)
+                if len(fresh) != len(positions):
+                    raise ValueError("Embedding service returned an unexpected vector count.")
+                cache.put_many(
+                    (keys[position], vector)
+                    for position, vector in zip(positions, fresh, strict=True)
+                )
+                for position, vector in zip(positions, fresh, strict=True):
+                    vectors[position] = vector
+    except (OSError, sqlite3.DatabaseError) as error:
+        print(
+            "  WARNING: embedding cache unavailable; embedding this document "
+            f"normally ({type(error).__name__}: {error})."
+        )
+        cache_stats.hits = 0
+        cache_stats.misses = len(documents)
+        return _embed_document_positions(
+            documents,
+            embeddings,
+            list(range(len(documents))),
+        )
+
+    if any(vector is None for vector in vectors):
+        raise RuntimeError("Embedding cache left one or more passages unresolved.")
+    return [vector for vector in vectors if vector is not None]
 
 
 def upsert_documents_in_batches(
@@ -1298,6 +1434,34 @@ def upsert_documents_in_batches(
 # ============================================================
 # Diagnostics
 # ============================================================
+
+
+@contextmanager
+def measure_stage(timings: dict[str, float], stage: str) -> Iterable[None]:
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[stage] = timings.get(stage, 0.0) + (time.perf_counter() - started)
+
+
+def show_ingestion_timings(
+    timings: dict[str, float],
+    *,
+    page_count: int,
+    cache_stats: EmbeddingCacheStats,
+) -> None:
+    total = timings.get("total", 0.0)
+    ordered = ("conversion", "chunking", "postprocess", "embedding", "index")
+    details = " | ".join(
+        f"{name} {timings.get(name, 0.0):.1f}s" for name in ordered
+    )
+    rate = page_count / total if total > 0 else 0.0
+    print(f"  Timing: {details} | total {total:.1f}s ({rate:.2f} pages/s)")
+    print(
+        "  Embedding cache: "
+        f"{cache_stats.hits} reused, {cache_stats.misses} computed"
+    )
 
 def debug_base_path(source_id: str) -> Path:
     safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(source_id).stem)
@@ -1466,6 +1630,35 @@ def convert_page_range_resilient(
         problem = f"{type(error).__name__}: {error}"
 
     gpu_oom = is_gpu_out_of_memory(problem)
+    allocation_failure = is_memory_allocation_failure(problem)
+
+    # Allocation failures usually describe the size of the current native
+    # preprocessing run, not a malformed PDF. Retry the same high-quality
+    # parser on smaller ranges before changing parser backends.
+    if allocation_failure and page_start < page_end:
+        midpoint = (page_start + page_end) // 2
+        print(
+            f"  Memory pressure on pages {page_start}-{page_end}; "
+            "retrying the primary parser on smaller ranges."
+        )
+        del result
+        release_cuda_memory()
+        return convert_page_range_resilient(
+            converter,
+            pdf_path,
+            page_start,
+            midpoint,
+            fallback_converter=fallback_converter,
+            source_name=source_name,
+        ) + convert_page_range_resilient(
+            converter,
+            pdf_path,
+            midpoint + 1,
+            page_end,
+            fallback_converter=fallback_converter,
+            source_name=source_name,
+        )
+
     if not gpu_oom and fallback_converter is not None:
         print("  Default PDF parser failed; retrying with PDFium backend.")
         try:
@@ -1554,6 +1747,9 @@ def process_pdf(
     docling_pdf_path: Path | None = None,
     commit_gate: Path | None = None,
 ) -> ProcessResult:
+    process_started = time.perf_counter()
+    timings: dict[str, float] = {}
+    cache_stats = EmbeddingCacheStats()
     source_id = pdf_path.resolve().relative_to(PDF_DIR.resolve()).as_posix()
     file_hash = calculate_file_hash(pdf_path)
     ocr_policy = "force" if ocr_enabled else "auto" if auto_ocr else "off"
@@ -1595,20 +1791,22 @@ def process_pdf(
     for page_start in range(1, page_count + 1, PDF_PAGE_WINDOW):
         page_end = min(page_start + PDF_PAGE_WINDOW - 1, page_count)
         print(f"  Converting pages {page_start}-{page_end} of {page_count}")
-        base_results = convert_page_range_resilient(
-            converter,
-            conversion_path,
-            page_start,
-            page_end,
-            fallback_converter=fallback_converter,
-            source_name=pdf_path.name,
-        )
+        with measure_stage(timings, "conversion"):
+            base_results = convert_page_range_resilient(
+                converter,
+                conversion_path,
+                page_start,
+                page_end,
+                fallback_converter=fallback_converter,
+                source_name=pdf_path.name,
+            )
 
         while base_results:
             base_result = base_results.pop(0)
             base_document = base_result.document
             base_pages = sorted(int(page) for page in base_document.pages)
-            base_markdown = base_document.export_to_markdown()
+            with measure_stage(timings, "chunking"):
+                base_markdown = base_document.export_to_markdown()
             final_results: list[tuple[Any, bool]] = [(base_result, ocr_enabled)]
 
             if (
@@ -1625,9 +1823,8 @@ def process_pdf(
                     f"  Sparse text on pages {retry_start}-{retry_end}; "
                     "retrying that range with OCR."
                 )
-                final_results = [
-                    (result, True)
-                    for result in convert_page_range_resilient(
+                with measure_stage(timings, "conversion"):
+                    ocr_results = convert_page_range_resilient(
                         ocr_converter,
                         conversion_path,
                         retry_start,
@@ -1635,27 +1832,28 @@ def process_pdf(
                         fallback_converter=ocr_fallback_converter,
                         source_name=pdf_path.name,
                     )
-                ]
+                final_results = [(result, True) for result in ocr_results]
                 base_result = None
                 base_document = None
                 gc.collect()
 
             for final_result, ocr_applied in final_results:
-                docling_document = final_result.document
-                batch_markdown = docling_document.export_to_markdown()
-                markdown_parts.append(batch_markdown)
-                raw_chunks = runtime.chunker.chunk(dl_doc=docling_document)
-                window_records = build_chunk_records(
-                    raw_chunks,
-                    runtime,
-                    ocr_applied=ocr_applied,
-                )
-                window_records, carried_headings = stitch_window_headings(
-                    window_records,
-                    carried_headings,
-                    runtime,
-                )
-                records.extend(window_records)
+                with measure_stage(timings, "chunking"):
+                    docling_document = final_result.document
+                    batch_markdown = docling_document.export_to_markdown()
+                    markdown_parts.append(batch_markdown)
+                    raw_chunks = runtime.chunker.chunk(dl_doc=docling_document)
+                    window_records = build_chunk_records(
+                        raw_chunks,
+                        runtime,
+                        ocr_applied=ocr_applied,
+                    )
+                    window_records, carried_headings = stitch_window_headings(
+                        window_records,
+                        carried_headings,
+                        runtime,
+                    )
+                    records.extend(window_records)
                 del raw_chunks, docling_document, final_result
                 gc.collect()
             final_results.clear()
@@ -1665,19 +1863,20 @@ def process_pdf(
 
         release_cuda_memory()
 
-    markdown = "\n\n".join(markdown_parts)
-    records = merge_short_chunks(records, runtime)
+    with measure_stage(timings, "postprocess"):
+        markdown = "\n\n".join(markdown_parts)
+        records = merge_short_chunks(records, runtime)
 
-    documents, ids = records_to_langchain(
-        records=records,
-        runtime=runtime,
-        pdf_path=pdf_path,
-        source_id=source_id,
-        file_hash=file_hash,
-        page_count=page_count,
-        tokenizer_name=runtime.tokenizer_name,
-        current_ingestion_fingerprint=current_fingerprint,
-    )
+        documents, ids = records_to_langchain(
+            records=records,
+            runtime=runtime,
+            pdf_path=pdf_path,
+            source_id=source_id,
+            file_hash=file_hash,
+            page_count=page_count,
+            tokenizer_name=runtime.tokenizer_name,
+            current_ingestion_fingerprint=current_fingerprint,
+        )
 
     if not documents:
         print("  No usable chunks were produced.")
@@ -1686,43 +1885,55 @@ def process_pdf(
     # Complete every model call before touching the active index. In concurrent
     # mode, the app pauses search only for this short commit window so dense and
     # lexical retrieval never observe different source revisions.
-    vectors = embed_documents_in_batches(documents, embeddings)
-    with index_commit_window(commit_gate, source_id):
-        upsert_documents_in_batches(
-            collection=collection,
-            documents=documents,
-            ids=ids,
-            vectors=vectors,
-            existing_ids=existing_ids,
+    with measure_stage(timings, "embedding"):
+        vectors = embed_documents_in_batches(
+            documents,
+            embeddings,
+            stats=cache_stats,
         )
+    with measure_stage(timings, "index"):
+        with index_commit_window(commit_gate, source_id):
+            upsert_documents_in_batches(
+                collection=collection,
+                documents=documents,
+                ids=ids,
+                vectors=vectors,
+                existing_ids=existing_ids,
+            )
 
-        new_id_set = set(ids)
-        old_ids = [chunk_id for chunk_id in existing_ids if chunk_id not in new_id_set]
-        if old_ids:
-            collection.delete(ids=old_ids)
+            new_id_set = set(ids)
+            old_ids = [chunk_id for chunk_id in existing_ids if chunk_id not in new_id_set]
+            if old_ids:
+                collection.delete(ids=old_ids)
 
-        replace_lexical_source(
-            path=LEXICAL_DB_PATH,
-            source_id=source_id,
-            documents=documents,
-            ids=ids,
-        )
+            replace_lexical_source(
+                path=LEXICAL_DB_PATH,
+                source_id=source_id,
+                documents=documents,
+                ids=ids,
+            )
 
-        manifest["sources"][source_id] = {
-            "complete": True,
-            "file_hash": file_hash,
-            "ingestion_fingerprint": current_fingerprint,
-            "embedding_fingerprint": embedding_fingerprint(),
-            "chunk_count": len(ids),
-            "ids_fingerprint": ids_fingerprint(ids),
-        }
-        save_manifest(manifest)
+            manifest["sources"][source_id] = {
+                "complete": True,
+                "file_hash": file_hash,
+                "ingestion_fingerprint": current_fingerprint,
+                "embedding_fingerprint": embedding_fingerprint(),
+                "chunk_count": len(ids),
+                "ids_fingerprint": ids_fingerprint(ids),
+            }
+            save_manifest(manifest)
 
     try:
         export_debug_files(source_id, markdown, documents)
     except OSError as error:
         print(f"  WARNING: debug export failed: {error}")
     show_document_summary(documents, markdown)
+    timings["total"] = time.perf_counter() - process_started
+    show_ingestion_timings(
+        timings,
+        page_count=page_count,
+        cache_stats=cache_stats,
+    )
 
     return ProcessResult(status="stored", chunks=len(documents))
 
@@ -1961,6 +2172,16 @@ def main() -> None:
     print(f"OCR enabled: {ocr_enabled}")
     print(f"Automatic OCR fallback: {auto_ocr}")
     print(f"Table structure enabled: {ENABLE_TABLE_STRUCTURE}")
+    print(
+        "Adaptive conversion: "
+        f"{PDF_PAGE_WINDOW}-page windows, "
+        f"page/model batches {DOCLING_PAGE_BATCH_SIZE}/{DOCLING_MODEL_BATCH_SIZE}, "
+        f"{DOCLING_NUM_THREADS} preprocessing threads"
+    )
+    print(
+        "Embedding cache: "
+        + (str(EMBEDDING_CACHE_PATH) if EMBEDDING_CACHE_ENABLED else "disabled")
+    )
     report_cuda_headroom()
 
     collection = create_collection()

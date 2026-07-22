@@ -4,14 +4,18 @@ import time
 
 from ingest import (
     ChunkRecord,
+    EmbeddingCacheStats,
     convert_page_range_resilient,
     docling_safe_pdf_path,
+    embed_documents_in_batches,
     ids_fingerprint,
     infer_document_title,
     infer_retrieval_unit_type,
     index_commit_window,
     is_cuda_out_of_memory,
     merge_short_chunks,
+    recommended_docling_batch_size,
+    recommended_docling_threads,
     report_cuda_headroom,
     split_text_for_retrieval,
     split_structural_record,
@@ -224,6 +228,123 @@ def test_failed_page_window_is_split_until_it_succeeds(tmp_path) -> None:
     )
     pages = sorted(page for result in results for page in result.document.pages)
     assert pages == [1, 2, 3, 4, 5]
+
+
+def test_allocation_failure_splits_before_parser_fallback(tmp_path) -> None:
+    calls = []
+
+    class PrimaryConverter:
+        def convert(self, path, page_range, raises_on_error):
+            calls.append(page_range)
+            start, end = page_range
+            if end - start + 1 > 2:
+                return SimpleNamespace(
+                    document=SimpleNamespace(pages={}),
+                    errors=[SimpleNamespace(error_message="std::bad_alloc")],
+                )
+            return SimpleNamespace(
+                document=SimpleNamespace(
+                    pages={page: object() for page in range(start, end + 1)}
+                ),
+                errors=[],
+            )
+
+    class UnexpectedFallback:
+        def convert(self, *args, **kwargs):
+            raise AssertionError("fallback must not replace a parser that can split")
+
+    results = convert_page_range_resilient(
+        PrimaryConverter(),
+        tmp_path / "large.pdf",
+        1,
+        6,
+        fallback_converter=UnexpectedFallback(),
+    )
+
+    assert calls[0] == (1, 6)
+    assert sorted(page for result in results for page in result.document.pages) == list(
+        range(1, 7)
+    )
+
+
+def test_docling_tuning_is_conservative_and_hardware_aware() -> None:
+    assert recommended_docling_batch_size(None) == 2
+    assert recommended_docling_batch_size(6_144) == 2
+    assert recommended_docling_batch_size(8_192) == 3
+    assert recommended_docling_batch_size(12_288) == 4
+    assert recommended_docling_threads(2) == 2
+    assert recommended_docling_threads(8) == 4
+    assert recommended_docling_threads(64) == 4
+
+
+def test_embedding_cache_reuses_exact_title_aware_prompt(tmp_path, monkeypatch) -> None:
+    from langchain_core.documents import Document
+
+    class FakeEmbeddings:
+        def __init__(self):
+            self.calls = 0
+
+        def embed_documents_with_titles(self, texts, titles):
+            self.calls += 1
+            return [
+                [float(len(text)), float(len(title or ""))]
+                for text, title in zip(texts, titles, strict=True)
+            ]
+
+    documents = [
+        Document(page_content="alpha", metadata={"document_title": "Manual"}),
+        Document(page_content="beta", metadata={"document_title": "Manual"}),
+    ]
+    cache_path = tmp_path / "embedding-cache.sqlite3"
+    monkeypatch.setattr(ingest, "embedding_fingerprint", lambda: "model-revision")
+    first_embeddings = FakeEmbeddings()
+    first_stats = EmbeddingCacheStats()
+    first = embed_documents_in_batches(
+        documents,
+        first_embeddings,
+        cache_path=cache_path,
+        stats=first_stats,
+    )
+    second_embeddings = FakeEmbeddings()
+    second_stats = EmbeddingCacheStats()
+    second = embed_documents_in_batches(
+        documents,
+        second_embeddings,
+        cache_path=cache_path,
+        stats=second_stats,
+    )
+
+    assert first == second
+    assert first_embeddings.calls == 1
+    assert second_embeddings.calls == 0
+    assert (first_stats.hits, first_stats.misses) == (0, 2)
+    assert (second_stats.hits, second_stats.misses) == (2, 0)
+
+    changed_title = [
+        Document(page_content="alpha", metadata={"document_title": "New title"})
+    ]
+    title_embeddings = FakeEmbeddings()
+    title_stats = EmbeddingCacheStats()
+    embed_documents_in_batches(
+        changed_title,
+        title_embeddings,
+        cache_path=cache_path,
+        stats=title_stats,
+    )
+    assert title_embeddings.calls == 1
+    assert title_stats.misses == 1
+
+    monkeypatch.setattr(ingest, "embedding_fingerprint", lambda: "new-model-revision")
+    revised_embeddings = FakeEmbeddings()
+    revised_stats = EmbeddingCacheStats()
+    embed_documents_in_batches(
+        documents,
+        revised_embeddings,
+        cache_path=cache_path,
+        stats=revised_stats,
+    )
+    assert revised_embeddings.calls == 1
+    assert (revised_stats.hits, revised_stats.misses) == (0, 2)
 
 
 def test_unicode_pdf_name_is_staged_as_temporary_ascii_path(tmp_path) -> None:

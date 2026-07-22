@@ -28,6 +28,7 @@ every product feature should preserve a route back to the original document.
 | `app_settings.py` | Search, reranking, and server environment settings | Storage and embedding clients |
 | `hardware.py` | Backend detection, saved profile, and CUDA/ROCm device mapping | Model loading or UI policy |
 | `rag_common.py` | Shared paths, embedding fingerprint, Ollama embeddings | UI and ranking policy |
+| `embedding_cache.py` | Revision- and prompt-keyed float32 document-vector cache | Query embeddings or ranking policy |
 | `ingest.py` | Docling conversion, chunking, provenance, embedding, Chroma writes | Search presentation |
 | `lexical_index.py` | SQLite FTS schema, query lanes, and lexical persistence | Dense retrieval |
 | `search_app.py` | Runtime lifecycle, hybrid retrieval, reranking, citations, JSON APIs, PDF viewer | Document file mutations |
@@ -84,6 +85,10 @@ workspace matters.
    reset, force-checkout, merge divergent history, or include ignored runtime
    data. The API confirmation token prevents another browser origin from
    triggering an update blindly.
+9. An embedding-cache key includes the embedding fingerprint and exact
+   title-aware document prompt. Allocation failures split the primary Docling
+   parser range before a fallback backend is selected; neither optimization may
+   silently omit a page or reuse a vector from another model revision.
    Document titles may come only from credible page-one evidence or the source
    filename; inherited headings from later pages are never document metadata.
 8. Workspace data is independent from ingestion and must survive index rebuilds.

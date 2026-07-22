@@ -192,6 +192,12 @@ def clean_title(title: str | None) -> str:
     return value[:300] or "none"
 
 
+def document_embedding_input(text: str, title: str | None) -> str:
+    """Return the exact document prompt used by Qwen and the vector cache."""
+
+    return DOCUMENT_PREFIX_TEMPLATE.format(title=clean_title(title), text=text)
+
+
 class OllamaRetrievalEmbeddings(Embeddings):
     """Qwen retrieval prompts shared by ingestion and search."""
 
@@ -227,7 +233,7 @@ class OllamaRetrievalEmbeddings(Embeddings):
             raise ValueError("Every document must have exactly one title.")
 
         prompted = [
-            DOCUMENT_PREFIX_TEMPLATE.format(title=clean_title(title), text=text)
+            document_embedding_input(text, title)
             for text, title in zip(text_list, title_list, strict=True)
         ]
         vectors = self._ollama.embed_documents(prompted)
