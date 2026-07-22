@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hardware import accelerator_info, backend_label, normalize_accelerator  # noqa: E402
+from app_settings import RERANKER_PRESETS, reranker_configuration  # noqa: E402
 
 
 MINIMUM_GPU_BYTES = int(7.5 * 1024**3)
@@ -27,11 +28,6 @@ CHUNK_TOKENIZER = os.environ.get(
     "RAG_CHUNK_TOKENIZER_MODEL",
     "Qwen/Qwen3-Embedding-0.6B",
 )
-RERANKER_MODEL = os.environ.get(
-    "RAG_RERANKER_MODEL",
-    "Qwen/Qwen3-Reranker-0.6B",
-)
-RERANKER_REVISION = os.environ.get("RAG_RERANKER_REVISION", "main")
 
 
 def ollama_status() -> tuple[bool, str]:
@@ -59,20 +55,50 @@ def model_cache_status() -> tuple[bool, str]:
             local_files_only=True,
             token=False,
         )
-        snapshot = Path(
-            snapshot_download(
-                repo_id=RERANKER_MODEL,
-                revision=RERANKER_REVISION,
-                local_files_only=True,
-                token=False,
-                allow_patterns=["*.safetensors"],
+        weight_snapshots = {
+            str(configuration["label"]): Path(
+                snapshot_download(
+                    repo_id=str(configuration["model"]),
+                    revision=str(configuration["revision"]),
+                    local_files_only=True,
+                    token=False,
+                    allow_patterns=["*.safetensors"],
+                )
             )
-        )
+            for choice in RERANKER_PRESETS
+            for configuration in (reranker_configuration(choice),)
+        }
+        code_snapshots = {
+            f"{configuration['label']} trusted code": Path(
+                snapshot_download(
+                    repo_id=str(configuration["code_repository"]),
+                    revision=str(configuration["code_revision"]),
+                    local_files_only=True,
+                    token=False,
+                    allow_patterns=["*.json", "*.py"],
+                )
+            )
+            for choice in RERANKER_PRESETS
+            for configuration in (reranker_configuration(choice),)
+            if configuration["code_repository"]
+        }
     except Exception as error:
-        return False, f"Qwen model cache is incomplete ({type(error).__name__})."
-    if not any(snapshot.rglob("*.safetensors")):
-        return False, "Qwen reranker weights are missing from the local cache."
-    return True, "Qwen tokenizer and reranker cache are ready."
+        return False, f"Model cache is incomplete ({type(error).__name__})."
+    missing = [
+        label
+        for label, snapshot in weight_snapshots.items()
+        if not any(snapshot.rglob("*.safetensors"))
+    ]
+    if missing:
+        return False, f"Reranker weights are missing for: {', '.join(missing)}."
+    missing_code = [
+        label
+        for label, snapshot in code_snapshots.items()
+        if not any(snapshot.rglob("*.py"))
+    ]
+    if missing_code:
+        return False, f"Trusted reranker code is missing for: {', '.join(missing_code)}."
+    return True, "Embedding tokenizer and selectable reranker caches are ready."
 
 
 def main() -> int:

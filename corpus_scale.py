@@ -73,11 +73,12 @@ class CorpusScaleManager:
     @staticmethod
     def _default_state() -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "paused": False,
             "pause_requested_at": None,
             "run_id": None,
             "items": [],
+            "migration_history": [],
             "updated_at": utc_now(),
         }
 
@@ -90,13 +91,26 @@ class CorpusScaleManager:
             return self._default_state()
         if not isinstance(state, dict):
             return self._default_state()
-        state.setdefault("version", 1)
+        previous_version = int(state.get("version") or 1)
+        state["version"] = 2
         state.setdefault("paused", False)
         state.setdefault("pause_requested_at", None)
         state.setdefault("run_id", None)
         state["items"] = [
             item for item in state.get("items", []) if isinstance(item, dict)
         ][-300:]
+        state.setdefault("migration_history", [])
+        if previous_version < 2:
+            backup = self.state_path.with_name(
+                f"{self.state_path.name}.pre-v2-migration.bak"
+            )
+            if not backup.exists():
+                shutil.copy2(self.state_path, backup)
+            state["migration_history"] = [
+                *state["migration_history"],
+                {"from": previous_version, "to": 2, "applied_at": utc_now()},
+            ][-20:]
+            self._write(state)
         return state
 
     def _write(self, state: dict[str, Any]) -> None:
@@ -117,6 +131,16 @@ class CorpusScaleManager:
                 if item.get("status") == "processing":
                     item["status"] = "queued"
                     item["error"] = "The previous app session ended during ingestion."
+                    if hasattr(self.repository, "transition"):
+                        try:
+                            self.repository.transition(
+                                str(item.get("source_id") or ""),
+                                "pending",
+                                reason="Recovered interrupted ingestion",
+                                error=str(item["error"]),
+                            )
+                        except (OSError, ValueError):
+                            pass
                     changed = True
             if changed:
                 self._write(state)
@@ -295,6 +319,39 @@ class CorpusScaleManager:
                 ),
                 "updated_at": state.get("updated_at"),
             }
+
+    def reconcile_indexed_documents(self, summary: dict[str, Any]) -> list[str]:
+        """Finish stale queue items whose exact documents are already indexed."""
+
+        pending = {str(item) for item in summary.get("pending_sources", [])}
+        indexed = {
+            str(item.get("source_id") or "")
+            for item in summary.get("documents", [])
+            if item.get("status") == "indexed"
+        }
+        with self._lock:
+            state = self._read()
+            run_id = state.get("run_id")
+            now = utc_now()
+            reconciled: list[str] = []
+            for item in state["items"]:
+                source_id = str(item.get("source_id") or "")
+                if (
+                    item.get("run_id") == run_id
+                    and item.get("action") == "ingest"
+                    and item.get("status") in {"queued", "processing"}
+                    and source_id in indexed
+                    and source_id not in pending
+                ):
+                    item["status"] = "complete"
+                    item["started_at"] = item.get("started_at") or now
+                    item["finished_at"] = now
+                    item["error"] = "Already indexed; stale queue state reconciled."
+                    reconciled.append(source_id)
+            if reconciled:
+                self._write(state)
+                self.invalidate_health()
+            return reconciled
 
     def invalidate_health(self) -> None:
         self._health_cache = None

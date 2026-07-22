@@ -1,4 +1,4 @@
-import { Archive, ArchiveRestore, FilePlus2, FileText, FolderOpen, HardDrive, LoaderCircle, Pause, Pencil, Play, RefreshCw, RotateCcw, Search, ShieldAlert, ShieldCheck, Trash2, Upload } from "lucide-react"
+import { Archive, ArchiveRestore, Download, FilePlus2, FileText, FolderOpen, HardDrive, LoaderCircle, Pause, Pencil, Play, RefreshCw, RotateCcw, Search, ShieldAlert, ShieldCheck, Trash2, Upload } from "lucide-react"
 import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import { EmptyState } from "@/components/empty-state"
@@ -239,6 +239,7 @@ export function DocumentsPage() {
   return (
     <div>
       <PageHeader title="Documents" actions={<>
+        <Button variant="outline" asChild><a href="/api/diagnostics/export"><Download /> Export diagnostics</a></Button>
         <Button variant="outline" onClick={() => void sync(true)} disabled={Boolean(state.job.running)}><RefreshCw /> Reindex all</Button>
         <Button onClick={() => void sync(false)} disabled={!state.counts.pending || Boolean(state.job.running)}>{state.job.running ? <LoaderCircle className="animate-spin" /> : <RotateCcw />} Apply changes{state.counts.pending ? ` (${state.counts.pending})` : ""}</Button>
       </>} />
@@ -332,7 +333,7 @@ export function DocumentsPage() {
                   <td className="hidden px-4 py-3 tabular-nums md:table-cell">{document.pages ?? "—"}</td>
                   <td className="hidden px-4 py-3 text-muted-foreground lg:table-cell">{formatBytes(document.size)}</td>
                   <td className="hidden px-4 py-3 text-muted-foreground lg:table-cell">{formatDate(document.modified_at)}</td>
-                  <td className="px-4 py-3"><Badge variant={document.status === "Indexed" || document.status === "indexed" ? "default" : "secondary"}>{document.status}</Badge></td>
+                  <td className="px-4 py-3"><Badge variant={document.status === "indexed" ? "default" : document.status === "failed" ? "destructive" : "secondary"}>{document.status}</Badge>{document.state_updated_at && <p className="mb-0 mt-1 text-[10px] text-muted-foreground">{formatDate(document.state_updated_at)}</p>}{Boolean(document.state_history?.length) && <details className="mt-1"><summary className="cursor-pointer text-[10px] text-muted-foreground">Lifecycle</summary><div className="mt-1 w-64 space-y-1 rounded-md border bg-popover p-2">{document.state_history?.slice().reverse().slice(0, 6).map((event, index) => <div key={`${event.at}-${index}`} className="text-[10px]"><span className="font-medium">{event.from ? `${event.from} → ` : ""}{event.to}</span><span className="text-muted-foreground"> · {formatDate(event.at)}</span>{event.reason && <p className="m-0 text-muted-foreground">{event.reason}</p>}</div>)}</div></details>}</td>
                   <td className="px-4 py-3"><div className="flex gap-1"><Button size="icon" variant="ghost" aria-label="Move or rename" onClick={() => { setMoveItem(document); setTarget(document.source_id) }}><Pencil /></Button><Button size="icon" variant="ghost" className="text-destructive" aria-label="Delete" onClick={() => void trashDocument(document)}><Trash2 /></Button></div></td>
                 </tr>)}</tbody>
               </table>

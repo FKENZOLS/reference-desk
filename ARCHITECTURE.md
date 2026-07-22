@@ -13,7 +13,7 @@ PDFs
   -> parent/child chunk preparation
   -> Qwen3-Embedding vectors + SQLite FTS5
   -> reciprocal-rank fusion
-  -> Qwen3-Reranker yes/no scoring
+  -> isolated BGE or multilingual GTE cross-encoder worker
   -> results, feedback, citations, PDF viewer, and research workspace
 ```
 
@@ -31,11 +31,12 @@ every product feature should preserve a route back to the original document.
 | `ingest.py` | Docling conversion, chunking, provenance, embedding, Chroma writes | Search presentation |
 | `lexical_index.py` | SQLite FTS schema, query lanes, and lexical persistence | Dense retrieval |
 | `search_app.py` | Runtime lifecycle, hybrid retrieval, reranking, citations, JSON APIs, PDF viewer | Document file mutations |
+| `reranker_worker.py` | Spawned reranker process, IPC, timeouts, and worker recovery | Search ranking policy or FastAPI routes |
 | `frontend/src/` | React pages and local shadcn-style presentation components | Retrieval, persistence, or GPU lifecycle |
 | `frontend/dist/` | Checked-in production UI bundle served by FastAPI | Hand-edited source |
 | `document_manager.py` | Safe PDF repository operations and legacy HTML fallback | Chroma ingestion internals |
 | `corpus_scale.py` | Persistent queue state, health/storage, quarantine coordination, backups | Docling conversion or search ranking |
-| `workspace_store.py` | History, bookmarks, notes, collections, and export data | Search ranking |
+| `workspace_store.py` | History, bookmarks, notes, collections, feedback, immutable benchmark versions, experiments, notifications, and schema migrations | Search ranking |
 | `workspace_ui.py` | Legacy research-workspace fallback | SQLite queries |
 | `quality_ui.py` | Legacy quality-dashboard fallback | Threshold fitting or retrieval |
 | `evaluate.py` | Offline labeled evaluation and metrics | Production state changes |
@@ -89,21 +90,61 @@ workspace matters.
 16. Embedding dimensions, prompts, model revisions, and collection names are
     part of the index identity. Qwen's 1024-dimensional vectors must never be
     inserted into a legacy 768-dimensional collection.
-17. Relevance calibration is reranker-specific. Scores from BGE and Qwen must
+17. Relevance calibration is reranker-specific. Scores from BGE and GTE must
     never be fitted into the same threshold.
+18. Cross-encoder models and their CUDA context live only in the reranker
+    worker. A device-side assertion must replace that worker, not the server.
+19. Document lifecycle state, transition history, errors, and indexed hash are
+    stored in one versioned record. Pending and deleted source lists are derived
+    compatibility views, not independent sources of truth.
+20. A BGE/GTE comparison must reuse the same retrieved candidate pool.
+21. Tables repeat their column headers in every child unit; hierarchy and
+    paragraph/table/list/definition/requirement/equation type remain indexed
+    metadata and therefore part of the ingestion fingerprint.
+22. Ambiguous questions never become evaluation cases. Expected-page labels
+    are acceptable locations and wrong displayed passages are hard negatives.
+23. Production promotion must fail when a configured held-out nDCG regression
+    exceeds its threshold.
+24. Persistent-store migrations are versioned and make a recoverable snapshot
+    before changing existing local data.
+25. Diagnostic exports contain aggregate operational data only. Document
+    paths/titles, PDFs, passages, queries, and feedback text stay excluded.
 
 ## Application lifecycle
 
 ### Search
 
-1. Load the Chroma collection, embedding client, lexical state, and reranker.
-2. Retrieve dense and lexical candidates independently.
+1. Load the Chroma collection, embedding client, and lexical state, then spawn
+   the startup reranker worker. Rebuild GTE's position buffer and run a
+   realistic preflight inside that worker before reporting it ready.
+2. Analyze deterministic query signals and allocate dense, lexical, and rerank
+   candidates. Retrieve the two lanes independently.
 3. Fuse the candidate ranks.
 4. Rerank the bounded fused shortlist.
-5. Apply diversity and optional calibrated relevance filtering.
+5. Apply diversity and optional calibrated relevance filtering while recording
+   a selection or exclusion reason for every reranked candidate.
 6. Register source navigation and render citation links.
 7. Return structured result, score, citation, and feedback payloads to React.
-8. Persist explicit user judgments separately from the retrieval index.
+8. Persist explicit user judgments separately from the retrieval index and
+   key them by reranker fingerprint.
+9. Treat a CUDA device-side assertion as worker-fatal. Replace the worker and
+   ask the user to retry while FastAPI, documents, and browser state stay live.
+10. Apply the reranker, candidate count, reranker weight, and passage mode from
+    the saved single-model production experiment when one is active.
+
+### Evaluation workbench
+
+1. Import a versioned JSONL benchmark or select cases derived from feedback.
+2. Retrieve each query once and cache the fused candidates.
+3. Run GTE, BGE, or both with the selected candidate count, reranker weight,
+   and passage input mode.
+4. Evaluate the selected calibration/test split, multiple acceptable passages,
+   and hard negatives; save nDCG, MRR, recall, latency, confidence intervals,
+   subgroup summaries, and failed-query summaries in SQLite.
+5. Compare only against a baseline with the exact same benchmark signature,
+   split, and every requested model, then compute the configured nDCG@5 gate.
+6. Promote only a completed single-model experiment that passes its regression
+   gate; comparison runs cannot be production defaults.
 
 ### Managed ingestion
 
@@ -127,6 +168,7 @@ workspace matters.
 | Chunk size, overlap, or parent context | `ingest.py` | Rebuild index and run ingestion tests |
 | Embedding model or revision | `rag_common.py` | New fingerprint and full rebuild |
 | Candidate counts or reranker policy | `app_settings.py`, `search_app.py` | Labeled evaluation |
+| Worker recovery or inference IPC | `reranker_worker.py`, `search_app.py` | Reranker recovery tests and live GPU smoke test |
 | Exact-term matching | `lexical_index.py` | Lexical and retrieval tests |
 | Citation geometry or PDF viewer | `search_app.py` citation/viewer section | Viewer HTML tests and browser check |
 | Document upload, move, or trash | `document_manager.py` | Path and route tests |
@@ -134,6 +176,7 @@ workspace matters.
 | Search, library, workspace, or quality layout | `frontend/src/` | Vite build, route tests, and browser check |
 | Notes, collections, or exports | `workspace_store.py`, `frontend/src/pages/workspace-page.tsx` | Workspace tests |
 | Feedback, benchmark export, or evidence calibration | `workspace_store.py`, `frontend/src/pages/quality-page.tsx` | Reference-quality tests and labeled evaluation |
+| Experiment workbench or production configuration | `workspace_store.py`, `frontend/src/pages/experiments-page.tsx` | Reference-quality tests, Vite build, and browser check |
 | HTTP routes or lifecycle | `search_app.py:create_web_app` | Route tests and live smoke test |
 
 ## Test layout

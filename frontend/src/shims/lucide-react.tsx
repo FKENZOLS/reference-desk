@@ -1,7 +1,7 @@
-import type { SVGProps } from "react"
+import type { ReactElement, SVGProps } from "react"
 
-export type LucideIcon = (props: SVGProps<SVGSVGElement>) => JSX.Element
-const icon = (paths: JSX.Element): LucideIcon => function Icon({ className, ...props }) {
+export type LucideIcon = (props: SVGProps<SVGSVGElement>) => ReactElement
+const icon = (paths: ReactElement): LucideIcon => function Icon({ className, ...props }) {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true" {...props}>{paths}</svg>
 }
 const documentShape = <><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></>
@@ -35,6 +35,8 @@ export const CheckCircle2 = icon(<><circle cx="12" cy="12" r="9"/>{checkShape}</
 export const XCircle = icon(<><circle cx="12" cy="12" r="9"/>{xShape}</>)
 export const X = icon(xShape)
 export const CircleAlert = icon(alertShape)
+export const Info = icon(alertShape)
+export const Bell = icon(<><path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 9H3c0-2 3-2 3-9"/><path d="M10 21h4"/></>)
 export const Flag = icon(<><path d="M5 21V4M5 5h12l-2 4 2 4H5"/></>)
 export const ThumbsUp = icon(<><path d="M7 10v10H3V10zM7 18h9l3-8h-6l1-6-3 1-4 7"/></>)
 export const ThumbsDown = icon(<><path d="M7 14V4H3v10zM7 6h9l3 8h-6l1 6-3-1-4-7"/></>)
@@ -43,6 +45,7 @@ export const LoaderCircle = icon(<path d="M21 12a9 9 0 1 1-6-8.5"/>)
 export const Upload = icon(<><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></>)
 export const Download = icon(<><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></>)
 export const RefreshCw = icon(arrowsShape)
+export const Undo2 = icon(<><path d="M9 7 4 12l5 5"/><path d="M4 12h10a6 6 0 0 1 6 6"/></>)
 export const RotateCcw = icon(arrowsShape)
 export const ArchiveRestore = icon(arrowsShape)
 export const FolderOpen = icon(<path d="M3 6h7l2 2h9l-2 11H4z"/>)
@@ -60,3 +63,5 @@ export const HardDrive = icon(<><rect x="3" y="5" width="18" height="14" rx="2"/
 export const Database = icon(<><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></>)
 export const Archive = icon(<><path d="M4 7h16v13H4zM3 4h18v3H3zM9 11h6"/></>)
 export const ShieldAlert = icon(<><path d="M12 3 4 6v6c0 5 3 8 8 10 5-2 8-5 8-10V6z"/><path d="M12 8v5M12 17h.01"/></>)
+export const FlaskConical = icon(<><path d="M9 3h6M10 3v6l-5 9a2 2 0 0 0 2 3h10a2 2 0 0 0 2-3l-5-9V3"/><path d="M7.5 16h9"/></>)
+export const Star = icon(<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9z"/>)

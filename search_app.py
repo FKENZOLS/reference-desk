@@ -1,4 +1,4 @@
-"""Local hybrid document retrieval and Qwen reranking application.
+"""Local hybrid document retrieval and cross-encoder reranking application.
 
 The application deliberately performs retrieval only. It does not generate an
 answer and does not rewrite the user's query with an LLM.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -43,11 +44,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-)
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from app_settings import (
     ADDITIONAL_RESULTS,
@@ -67,21 +64,20 @@ from app_settings import (
     QUALITY_MIN_NEGATIVE_LABELS,
     QUALITY_MIN_POSITIVE_LABELS,
     QUALITY_MIN_RECALL,
-    RERANK_BATCH_SIZE,
     RERANK_CANDIDATES,
-    RERANK_INSTRUCTION,
-    RERANK_MAX_LENGTH,
     RERANK_TOP_N,
-    RERANK_USE_FP16,
     RERANK_WEIGHT,
+    RERANKER_CHOICE,
     RERANKER_MODEL,
-    RERANKER_REVISION,
+    RERANKER_PRESETS,
     RERANKER_USE_AUTH,
     RRF_K,
     SEARCH_DURING_INGESTION,
     SERVER_HOST,
     SERVER_PORT,
+    reranker_configuration,
     reranker_fingerprint,
+    resolve_reranker_choice,
     resolve_reranker_backend,
 )
 from lexical_index import rebuild_from_collection
@@ -114,6 +110,11 @@ from workspace_store import WorkspaceStore, parse_export_ids
 from workspace_ui import workspace_html
 from quality_ui import quality_dashboard_html
 from corpus_scale import CorpusScaleManager, PAUSED_EXIT_CODE
+from reranker_worker import (
+    RerankerWorkerClient,
+    RerankerWorkerError,
+    is_fatal_gpu_error,
+)
 
 
 logging.basicConfig(
@@ -140,6 +141,12 @@ class Candidate:
     final_rank: int = 0
     rerank_token_count: int = 0
     rerank_truncated: bool = False
+    reranker_choice: str = RERANKER_CHOICE
+    reranker_model: str = RERANKER_MODEL
+    reranker_fingerprint: str = ""
+    found_by: str = ""
+    selection_reason: str = ""
+    exclusion_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -160,55 +167,87 @@ class RetrievalFilters:
 
 
 @dataclass
+class QueryPlan:
+    """Deterministic retrieval allocation for one query."""
+
+    strategy: str
+    dense_candidates: int
+    lexical_candidates: int
+    rerank_candidates: int
+    signals: list[str] = field(default_factory=list)
+    fusion_confidence: float = 0.0
+    language: str = "und"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "dense_candidates": self.dense_candidates,
+            "lexical_candidates": self.lexical_candidates,
+            "rerank_candidates": self.rerank_candidates,
+            "signals": list(self.signals),
+            "fusion_confidence": round(self.fusion_confidence, 4),
+            "language": self.language,
+        }
+
+
+@dataclass
 class Runtime:
     collection: Any
     vectorstore: Chroma
-    reranker: "LocalReranker"
+    reranker: "LocalReranker | RerankerWorkerClient | None"
+    reranker_choice: str = RERANKER_CHOICE
     inference_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-class LocalReranker:
-    """Qwen yes/no reranker with an optional classifier compatibility path."""
+class RerankerUnavailableError(RuntimeError):
+    """The local reranker cannot safely serve requests in this process."""
 
-    QWEN_PREFIX = (
-        "<|im_start|>system\n"
-        "Judge whether the Document meets the requirements based on the Query "
-        "and the Instruct provided. Note that the answer can only be \"yes\" "
-        "or \"no\".<|im_end|>\n<|im_start|>user\n"
-    )
-    QWEN_SUFFIX = (
-        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-    )
+
+class LocalReranker:
+    """Sequence-classification cross-encoder reranker."""
 
     def __init__(
         self,
-        model_name: str = RERANKER_MODEL,
-        max_length: int = RERANK_MAX_LENGTH,
-        batch_size: int = RERANK_BATCH_SIZE,
-        use_fp16: bool = RERANK_USE_FP16,
+        model_name: str | None = None,
+        max_length: int | None = None,
+        batch_size: int | None = None,
+        use_fp16: bool | None = None,
         device: str = RERANKER_DEVICE,
-        revision: str = RERANKER_REVISION,
-        instruction: str = RERANK_INSTRUCTION,
+        revision: str | None = None,
+        instruction: str | None = None,
+        choice: str = RERANKER_CHOICE,
     ) -> None:
-        self.model_name = model_name
-        self.max_length = max_length
-        self.batch_size = batch_size
+        configuration = reranker_configuration(choice)
+        self.choice = str(configuration["choice"])
+        self.model_name = model_name or str(configuration["model"])
+        self.max_length = max_length or int(configuration["max_length"])
+        self.batch_size = batch_size or int(configuration["batch_size"])
         self.device = resolve_torch_device(device)
-        self.backend = resolve_reranker_backend(model_name)
-        self.instruction = instruction
+        self.backend = resolve_reranker_backend(
+            self.model_name,
+            str(configuration["backend"]),
+        )
+        self.instruction = instruction or str(configuration["instruction"])
+        self.fingerprint = reranker_fingerprint(self.choice)
+        revision = revision or str(configuration["revision"])
+        code_revision = str(configuration["code_revision"])
+        use_fp16 = bool(configuration["use_fp16"]) if use_fp16 is None else use_fp16
+        self.trust_remote_code = bool(configuration["trust_remote_code"])
         model_token: bool = True if RERANKER_USE_AUTH else False
 
         LOGGER.info(
             "Loading reranker %s (%s) on %s",
-            model_name,
+            self.model_name,
             self.backend,
             self.device,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
+            self.model_name,
             revision=revision,
-            padding_side="left" if self.backend == "qwen-causal-lm" else "right",
+            code_revision=code_revision,
+            padding_side="right",
             token=model_token,
+            trust_remote_code=self.trust_remote_code,
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -217,39 +256,68 @@ class LocalReranker:
             if self.device.type == "cuda" and use_fp16
             else torch.float32
         )
-        model_class = (
-            AutoModelForCausalLM
-            if self.backend == "qwen-causal-lm"
-            else AutoModelForSequenceClassification
-        )
-        self.model = model_class.from_pretrained(
-            model_name,
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            self.model_name,
             revision=revision,
+            code_revision=code_revision,
             dtype=model_dtype,
             token=model_token,
+            trust_remote_code=self.trust_remote_code,
         )
         self.model.to(self.device)
+        self._repair_gte_position_ids()
         self.model.eval()
 
-        if self.backend == "qwen-causal-lm":
-            self._prefix_ids = self.tokenizer.encode(
-                self.QWEN_PREFIX,
-                add_special_tokens=False,
+    def validate(self) -> dict[str, Any]:
+        """Run a realistic startup inference before accepting live searches."""
+
+        validation_passage = (
+            "Technical document validation passage with requirements, tables, "
+            "identifiers, dates, and explanatory context. "
+        ) * 20
+        result = self.predict(
+            [("startup reranker validation", validation_passage)]
+        )
+        if len(result) != 1 or not all(
+            torch.isfinite(torch.tensor(value))
+            for value in result[0][:2]
+        ):
+            raise RuntimeError("Reranker startup validation returned invalid scores.")
+        return {
+            "token_count": int(result[0][2]),
+            "truncated": bool(result[0][3]),
+        }
+
+    def _repair_gte_position_ids(self) -> None:
+        """Rebuild GTE's non-persistent position buffer after model loading.
+
+        Recent Transformers low-memory loading can move the custom GTE model
+        through a meta tensor and leave this non-persistent buffer
+        uninitialized.  Short inputs may appear to work, while longer inputs
+        then use garbage values to index the RoPE cache and trigger a CUDA
+        device-side assertion.
+        """
+        if self.choice != "gte":
+            return
+
+        base_model = getattr(self.model, "new", None)
+        embeddings = getattr(base_model, "embeddings", None)
+        position_ids = getattr(embeddings, "position_ids", None)
+        if embeddings is None or not isinstance(position_ids, torch.Tensor):
+            LOGGER.warning(
+                "Could not locate GTE position_ids buffer; long CUDA inputs "
+                "may be incompatible with this model revision."
             )
-            self._suffix_ids = self.tokenizer.encode(
-                self.QWEN_SUFFIX,
-                add_special_tokens=False,
-            )
-            self._no_token_id = self.tokenizer.convert_tokens_to_ids("no")
-            self._yes_token_id = self.tokenizer.convert_tokens_to_ids("yes")
-            if self._no_token_id == self.tokenizer.unk_token_id or self._yes_token_id == self.tokenizer.unk_token_id:
-                raise RuntimeError("Qwen reranker tokenizer does not expose yes/no tokens.")
-            body_budget = self.max_length - len(self._prefix_ids) - len(self._suffix_ids)
-            if body_budget < 32:
-                raise ValueError(
-                    "RAG_RERANK_MAX_LENGTH is too small for the Qwen reranker prompt."
-                )
-            self._body_budget = body_budget
+            return
+
+        max_positions = int(
+            getattr(self.model.config, "max_position_embeddings", position_ids.numel())
+        )
+        embeddings.register_buffer(
+            "position_ids",
+            torch.arange(max_positions, device=self.device, dtype=torch.long),
+            persistent=False,
+        )
 
     def predict(
         self,
@@ -258,74 +326,7 @@ class LocalReranker:
         if not pairs:
             return []
 
-        if self.backend == "qwen-causal-lm":
-            return self._predict_qwen(pairs)
         return self._predict_classifier(pairs)
-
-    def _predict_qwen(
-        self,
-        pairs: Sequence[tuple[str, str]],
-    ) -> list[tuple[float, float, int, bool]]:
-        output: list[tuple[float, float, int, bool]] = []
-        for start in range(0, len(pairs), self.batch_size):
-            batch = pairs[start : start + self.batch_size]
-            bodies = [
-                (
-                    f"<Instruct>: {self.instruction}\n"
-                    f"<Query>: {query}\n"
-                    f"<Document>: {passage}"
-                )
-                for query, passage in batch
-            ]
-            untruncated = self.tokenizer(
-                bodies,
-                padding=False,
-                truncation=False,
-                add_special_tokens=False,
-            )["input_ids"]
-            overhead = len(self._prefix_ids) + len(self._suffix_ids)
-            token_counts = [overhead + len(input_ids) for input_ids in untruncated]
-            body_ids = self.tokenizer(
-                bodies,
-                padding=False,
-                truncation=True,
-                max_length=self._body_budget,
-                add_special_tokens=False,
-            )["input_ids"]
-            encoded = self.tokenizer.pad(
-                {
-                    "input_ids": [
-                        self._prefix_ids + input_ids + self._suffix_ids
-                        for input_ids in body_ids
-                    ]
-                },
-                padding=True,
-                return_tensors="pt",
-            )
-            encoded = {key: value.to(self.device) for key, value in encoded.items()}
-
-            with torch.inference_mode():
-                final_logits = self.model(**encoded).logits[:, -1, :].float()
-                no_logits = final_logits[:, self._no_token_id]
-                yes_logits = final_logits[:, self._yes_token_id]
-                log_odds = yes_logits - no_logits
-                probabilities = torch.sigmoid(log_odds)
-
-            for logit, probability, token_count in zip(
-                log_odds.cpu().tolist(),
-                probabilities.cpu().tolist(),
-                token_counts,
-                strict=True,
-            ):
-                output.append(
-                    (
-                        float(logit),
-                        float(probability),
-                        token_count,
-                        token_count > self.max_length,
-                    )
-                )
-        return output
 
     def _predict_classifier(
         self,
@@ -380,6 +381,7 @@ class LocalReranker:
 
 # Compatibility for local extensions that imported the previous class name.
 BGEReranker = LocalReranker
+_IN_PROCESS_RERANKER_CLASS = LocalReranker
 
 
 def resolve_torch_device(configured: str) -> torch.device:
@@ -436,6 +438,20 @@ def resolve_torch_device(configured: str) -> torch.device:
 
 _RUNTIME: Runtime | None = None
 _RUNTIME_LOCK = threading.Lock()
+_RERANKER_STATE_LOCK = threading.Lock()
+_RERANKER_FATAL = threading.Event()
+_RERANKER_STATE: dict[str, Any] = {
+    "status": "idle",
+    "choice": RERANKER_CHOICE,
+    "model": RERANKER_MODEL,
+    "device": "",
+    "message": "The startup reranker has not been loaded yet.",
+    "load_seconds": 0.0,
+    "preflight_tokens": 0,
+    "worker_pid": None,
+    "worker_restarts": 0,
+    "updated_at": datetime.now(tz=UTC).isoformat(),
+}
 _CITATION_COLLECTION: Any | None = None
 _CITATION_COLLECTION_LOCK = threading.Lock()
 _PDFIUM_LOCK = threading.RLock()
@@ -444,6 +460,28 @@ _SOURCE_NAVIGATION_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 SOURCE_NAVIGATION_CACHE_SIZE = 64
 SOURCE_NAVIGATION_TTL_SECONDS = 2 * 60 * 60
 WORKSPACE_STORE = WorkspaceStore()
+
+
+def _notify(
+    *,
+    kind: str,
+    title: str,
+    message: str = "",
+    status: str = "info",
+    task_key: str = "",
+) -> None:
+    """Persist a user-visible background update without breaking its task."""
+
+    try:
+        WORKSPACE_STORE.add_notification(
+            kind=kind,
+            title=title,
+            message=message,
+            status=status,
+            task_key=task_key,
+        )
+    except Exception:
+        LOGGER.exception("Could not persist a background notification")
 FRONTEND_DIST_DIR = Path(__file__).resolve().with_name("frontend") / "dist"
 DOCUMENT_REPOSITORY = DocumentRepository(
     pdf_dir=PDF_DIR,
@@ -467,6 +505,8 @@ MAX_DOCUMENT_UPLOAD_BYTES = int(
 _SEARCH_MAINTENANCE_LOCK = threading.Lock()
 _DOCUMENT_MAINTENANCE = threading.Event()
 _DOCUMENT_JOB_LOCK = threading.Lock()
+_EXPERIMENT_LOCK = threading.Lock()
+_EXPERIMENT_ACTIVE = threading.Event()
 _APP_RESTARTING = threading.Event()
 _APP_INSTANCE_ID = token_urlsafe(8)
 _DOCUMENT_JOB: dict[str, Any] = {
@@ -704,6 +744,12 @@ def _handle_corpus_event(line: str) -> bool:
     source_id = str(event.get("source_id") or "")
     if kind == "started" and source_id:
         CORPUS_SCALE.mark_event(source_id, "processing")
+        if hasattr(DOCUMENT_REPOSITORY, "transition"):
+            DOCUMENT_REPOSITORY.transition(
+                source_id,
+                "processing",
+                reason="Ingestion worker started processing",
+            )
         _update_document_job(message=f"Processing {source_id}")
     elif kind == "commit_requested":
         token = str(event.get("token") or "")
@@ -732,6 +778,13 @@ def _handle_corpus_event(line: str) -> bool:
                 "failed",
                 error=f"{error} Quarantine failed: {quarantine_error}",
             )
+            if hasattr(DOCUMENT_REPOSITORY, "transition"):
+                DOCUMENT_REPOSITORY.transition(
+                    source_id,
+                    "failed",
+                    reason="Ingestion failed and quarantine was unavailable",
+                    error=f"{error} Quarantine failed: {quarantine_error}",
+                )
         else:
             CORPUS_SCALE.mark_event(source_id, "quarantined", error=error)
         CORPUS_SCALE.invalidate_health()
@@ -753,15 +806,29 @@ def _release_search_runtime() -> None:
     with _CITATION_COLLECTION_LOCK:
         _CITATION_COLLECTION = None
 
+    released_in_process_model = False
     if runtime is not None:
         reranker = runtime.reranker
-        if hasattr(reranker, "model"):
+        if reranker is not None and hasattr(reranker, "close"):
+            reranker.close()
+        elif reranker is not None and hasattr(reranker, "model"):
             del reranker.model
-        if hasattr(reranker, "tokenizer"):
+            released_in_process_model = True
+        if (
+            reranker is not None
+            and not hasattr(reranker, "close")
+            and hasattr(reranker, "tokenizer")
+        ):
             del reranker.tokenizer
         del runtime
+    if not _RERANKER_FATAL.is_set():
+        _set_reranker_state(
+            status="idle",
+            message="Search models were released for document maintenance.",
+            device="",
+        )
     gc.collect()
-    if torch.cuda.is_available():
+    if released_in_process_model and torch.cuda.is_available():
         torch.cuda.empty_cache()
         try:
             torch.cuda.ipc_collect()
@@ -987,6 +1054,17 @@ def _run_document_index_job(
                 ),
                 finished_at=datetime.now(tz=UTC).isoformat(),
             )
+            _notify(
+                kind="indexing",
+                title="Document indexing complete",
+                message=(
+                    f"Completed with {quarantined} quarantined document(s)."
+                    if quarantined
+                    else "The searchable index is current."
+                ),
+                status="warning" if quarantined else "success",
+                task_key="document-index",
+            )
         elif exit_code == PAUSED_EXIT_CODE:
             _update_document_job(
                 state="paused",
@@ -994,6 +1072,13 @@ def _run_document_index_job(
                 pause_requested=False,
                 message="Queue paused. Search is available; resume when you are ready.",
                 finished_at=datetime.now(tz=UTC).isoformat(),
+            )
+            _notify(
+                kind="indexing",
+                title="Document queue paused",
+                message="Pending work was preserved and can be resumed.",
+                status="warning",
+                task_key="document-index",
             )
         else:
             queue = CORPUS_SCALE.snapshot() if managed_queue else {"remaining": 1, "counts": {}}
@@ -1009,6 +1094,17 @@ def _run_document_index_job(
                 ),
                 finished_at=datetime.now(tz=UTC).isoformat(),
             )
+            _notify(
+                kind="indexing",
+                title="Document indexing needs attention",
+                message=(
+                    "Pending work was preserved."
+                    if remaining
+                    else "The queue completed with quarantined documents."
+                ),
+                status="error" if remaining else "warning",
+                task_key="document-index",
+            )
     except Exception as error:
         LOGGER.exception("Document index job failed")
         _append_document_job_log(f"{type(error).__name__}: {error}")
@@ -1017,6 +1113,13 @@ def _run_document_index_job(
             running=False,
             message="Index update failed. Pending changes were preserved.",
             finished_at=datetime.now(tz=UTC).isoformat(),
+        )
+        _notify(
+            kind="indexing",
+            title="Document indexing failed",
+            message="Pending changes were preserved.",
+            status="error",
+            task_key="document-index",
         )
     finally:
         _release_index_commit_barrier()
@@ -1073,6 +1176,113 @@ def start_document_index_job(
     return document_job_snapshot()
 
 
+def _set_reranker_state(**values: Any) -> None:
+    with _RERANKER_STATE_LOCK:
+        _RERANKER_STATE.update(values)
+        _RERANKER_STATE["updated_at"] = datetime.now(tz=UTC).isoformat()
+
+
+def reranker_runtime_status() -> dict[str, Any]:
+    with _RERANKER_STATE_LOCK:
+        status = dict(_RERANKER_STATE)
+    configuration = reranker_configuration(str(status.get("choice") or RERANKER_CHOICE))
+    status["label"] = str(configuration["label"])
+    status["restart_required"] = _RERANKER_FATAL.is_set()
+    runtime = _RUNTIME
+    worker = runtime.reranker if runtime is not None else None
+    if isinstance(worker, RerankerWorkerClient):
+        worker_status = worker.status()
+        status["worker_pid"] = worker_status["pid"]
+        status["worker_restarts"] = worker_status["restart_count"]
+        status["worker_alive"] = worker_status["alive"]
+    return status
+
+
+def _is_fatal_cuda_error(error: BaseException) -> bool:
+    return is_fatal_gpu_error(error)
+
+
+def _mark_reranker_failure(error: BaseException, choice: str) -> None:
+    # CUDA failures in the child are recoverable by replacing that child.
+    # Only legacy in-process inference can poison the FastAPI process itself.
+    fatal = _is_fatal_cuda_error(error) and not isinstance(error, RerankerWorkerError)
+    if fatal:
+        _RERANKER_FATAL.set()
+    _set_reranker_state(
+        status="restart_required" if fatal else "failed",
+        choice=choice,
+        model=str(reranker_configuration(choice)["model"]),
+        message=(
+            "CUDA inference failed and this server process must be restarted."
+            if fatal
+            else f"Reranker failed: {error}"
+        ),
+    )
+    _notify(
+        kind="reranker",
+        title=f"{choice.upper()} reranker failed",
+        message="The isolated worker can be restarted from Search.",
+        status="error",
+        task_key=f"reranker:{choice}",
+    )
+
+
+def _load_reranker(choice: str) -> RerankerWorkerClient:
+    selected = resolve_reranker_choice(choice)
+    configuration = reranker_configuration(selected)
+    _set_reranker_state(
+        status="loading",
+        choice=selected,
+        model=str(configuration["model"]),
+        message=f"Loading and validating {configuration['label']}…",
+        load_seconds=0.0,
+        preflight_tokens=0,
+    )
+    _notify(
+        kind="reranker",
+        title=f"Loading {configuration['label']} reranker",
+        message="The model is being validated in its isolated worker.",
+        task_key=f"reranker:{selected}",
+    )
+    started = perf_counter()
+    try:
+        reranker = RerankerWorkerClient(choice=selected)
+        validation = {"token_count": reranker.preflight_tokens}
+    except Exception as error:
+        _mark_reranker_failure(error, selected)
+        raise
+    load_seconds = perf_counter() - started
+    reranker.load_seconds = load_seconds
+    reranker.preflight_tokens = int(validation.get("token_count", 0))
+    _set_reranker_state(
+        status="ready",
+        choice=selected,
+        model=reranker.model_name,
+        device=str(getattr(reranker, "device", "test")),
+        message=f"{configuration['label']} is ready.",
+        load_seconds=load_seconds,
+        preflight_tokens=reranker.preflight_tokens,
+        worker_pid=reranker.pid,
+        worker_restarts=reranker.restart_count,
+    )
+    _notify(
+        kind="reranker",
+        title=f"{configuration['label']} reranker ready",
+        message=f"Loaded on {getattr(reranker, 'device', 'the selected device')}.",
+        status="success",
+        task_key=f"reranker:{selected}",
+    )
+    return reranker
+
+
+def configured_default_reranker_choice() -> str:
+    """Return the promoted single-model default, or the application default."""
+
+    production = WORKSPACE_STORE.production_experiment()
+    choice = str(((production or {}).get("config") or {}).get("reranker") or "")
+    return choice if choice in RERANKER_PRESETS else RERANKER_CHOICE
+
+
 def build_runtime() -> Runtime:
     if not DB_DIR.exists():
         raise FileNotFoundError(
@@ -1118,11 +1328,57 @@ def build_runtime() -> Runtime:
         collection_name=COLLECTION_NAME,
         embedding_function=create_embeddings(),
     )
+    default_choice = configured_default_reranker_choice()
     return Runtime(
         collection=collection,
         vectorstore=vectorstore,
-        reranker=LocalReranker(),
+        reranker=_load_reranker(default_choice),
+        reranker_choice=default_choice,
     )
+
+
+def select_runtime_reranker(
+    runtime: Runtime,
+    choice: str | None,
+) -> LocalReranker | RerankerWorkerClient:
+    """Return the requested reranker, replacing the loaded model when needed.
+
+    Only one reranker is retained at a time so the UI toggle does not double
+    GPU memory usage. The surrounding search lock prevents a model swap during
+    another live query.
+    """
+
+    selected = resolve_reranker_choice(choice or RERANKER_CHOICE)
+    if runtime.reranker is not None and runtime.reranker_choice == selected:
+        return runtime.reranker
+
+    previous = runtime.reranker
+    runtime.reranker = None
+    runtime.reranker_choice = ""
+    released_in_process_model = False
+    if previous is not None:
+        if hasattr(previous, "close"):
+            previous.close()
+        elif hasattr(previous, "model"):
+            del previous.model
+            released_in_process_model = True
+        if not hasattr(previous, "close") and hasattr(previous, "tokenizer"):
+            del previous.tokenizer
+        del previous
+    gc.collect()
+    if released_in_process_model and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Tests and local extensions historically replaced LocalReranker directly.
+    # Keep that seam while normal application use goes through the isolated
+    # worker client.
+    runtime.reranker = (
+        LocalReranker(choice=selected)
+        if LocalReranker is not _IN_PROCESS_RERANKER_CLASS
+        else _load_reranker(selected)
+    )
+    runtime.reranker_choice = selected
+    return runtime.reranker
 
 
 def get_runtime() -> Runtime:
@@ -1210,7 +1466,25 @@ def candidate_id(document: Document) -> str:
     )
 
 
-def build_rerank_passage(document: Document) -> str:
+def build_rerank_passage(
+    document: Document,
+    mode: str = "metadata-child",
+) -> str:
+    """Build a reranker passage, with explicit modes for offline ablations."""
+
+    valid_modes = {
+        "child",
+        "metadata-child",
+        "metadata-parent",
+        "metadata-child-parent",
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"Unknown reranker passage mode: {mode}")
+    child = document.page_content.strip()
+    parent = str(document.metadata.get("parent_content") or "").strip() or child
+    if mode == "child":
+        return child
+
     metadata = format_metadata(document.metadata)
     header_parts = [
         f"Document: {metadata['document_title']}",
@@ -1222,7 +1496,20 @@ def build_rerank_passage(document: Document) -> str:
         header_parts.append(f"Page: {metadata['page']}")
     if metadata["content_labels"]:
         header_parts.append(f"Content type: {metadata['content_labels']}")
-    return "\n".join(header_parts) + "\n\n" + document.page_content.strip()
+    unit_type = str(document.metadata.get("retrieval_unit_type") or "").strip()
+    if unit_type:
+        header_parts.append(f"Retrieval unit: {unit_type}")
+    table_header = str(document.metadata.get("table_header") or "").strip()
+    if table_header:
+        header_parts.append(f"Table columns: {table_header}")
+    header = "\n".join(header_parts)
+    if mode == "metadata-parent":
+        body = parent
+    elif mode == "metadata-child-parent" and parent != child:
+        body = f"{child}\n\nParent context:\n{parent}"
+    else:
+        body = child
+    return f"{header}\n\n{body}"
 
 
 def documents_by_id(collection: Any, ids: Sequence[str]) -> dict[str, Document]:
@@ -1306,6 +1593,7 @@ def candidates_from_ids(
     chunk_ids: Sequence[str],
     filters: RetrievalFilters | None = None,
     source_filter: str | None = None,
+    limit: int = RERANK_CANDIDATES,
 ) -> list[Candidate]:
     """Rebuild an ordered candidate set for search-within-results."""
 
@@ -1328,7 +1616,148 @@ def candidates_from_ids(
                 retrieval_rank=rank,
             )
         )
-    return candidates[:RERANK_CANDIDATES]
+    return candidates[: max(1, int(limit))]
+
+
+def analyze_query(question: str, *, within_results: bool = False) -> QueryPlan:
+    """Allocate retrieval work from cheap, explainable query signals."""
+
+    text = question.strip()
+    words = re.findall(r"[^\W_]+(?:[-./:][^\W_]+)*", text, flags=re.UNICODE)
+    lowered = text.casefold()
+    signals: list[str] = []
+    quoted = bool(re.search(r"[\"“”'][^\"“”']{2,}[\"“”']", text))
+    identifier = bool(
+        re.search(
+            r"\b(?:[A-Z]{2,}[A-Z0-9_.:/-]*\d[A-Z0-9_.:/-]*|"
+            r"[A-Za-z]+[-_:]\d{2,}|\d+(?:\.\d+){1,4})\b",
+            text,
+        )
+    )
+    error_code = bool(
+        re.search(
+            r"\b(?:CUDA|HTTP|ERR(?:OR)?|E|STATUS)[-_ :]*[A-Z0-9]{2,}\b|"
+            r"\b\d{3}\s+(?:error|failed|failure)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    date_signal = bool(
+        re.search(
+            r"\b(?:19|20)\d{2}(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?\b|"
+            r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+            r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|"
+            r"nov(?:ember)?|dec(?:ember)?)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    mathematical = bool(re.search(r"[=≈≤≥∑∫√]|\\(?:frac|sum|int|sqrt)\b", text))
+    title_signal = bool(
+        re.search(r"\b(?:title|document|paper|book)\s*:\s*\S|\.pdf\b", text, re.I)
+        or (
+            len(words) >= 3
+            and sum(word[:1].isupper() for word in words) / len(words) >= 0.7
+        )
+    )
+    language_scores = {
+        "pt": len(re.findall(r"\b(?:o|a|de|do|da|que|qual|como|onde|para|por)\b", lowered)),
+        "es": len(re.findall(r"\b(?:el|la|de|que|cuál|como|dónde|para|por)\b", lowered)),
+        "en": len(re.findall(r"\b(?:the|a|of|what|how|where|which|for|with)\b", lowered)),
+    }
+    language = max(language_scores, key=language_scores.get)
+    if language_scores[language] == 0:
+        language = "und"
+    question_form = bool(
+        re.match(
+            r"^(?:what|why|how|when|where|which|who|explain|describe|compare|"
+            r"qual|como|por que|porque|quando|onde|explique|descreva)\b",
+            lowered,
+        )
+    )
+    short = len(words) <= 3
+    if quoted:
+        signals.append("quoted phrase")
+    if identifier:
+        signals.append("identifier or section number")
+    if error_code:
+        signals.append("error code")
+    if date_signal:
+        signals.append("date")
+    if mathematical:
+        signals.append("mathematical expression")
+    if title_signal:
+        signals.append("document title")
+    if question_form:
+        signals.append("natural-language question")
+    if short:
+        signals.append("short query")
+
+    if within_results:
+        return QueryPlan(
+            strategy="within-results",
+            dense_candidates=0,
+            lexical_candidates=0,
+            rerank_candidates=max(8, min(12, RERANK_CANDIDATES)),
+            signals=[*signals, "existing result set"],
+            fusion_confidence=1.0,
+            language=language,
+        )
+    if quoted or identifier or error_code or date_signal or mathematical or title_signal:
+        return QueryPlan(
+            strategy="lexical-first",
+            dense_candidates=max(16, round(DENSE_CANDIDATES * 0.6)),
+            lexical_candidates=max(48, round(LEXICAL_CANDIDATES * 1.4)),
+            rerank_candidates=RERANK_CANDIDATES,
+            signals=signals,
+            language=language,
+        )
+    if short:
+        return QueryPlan(
+            strategy="wide-short-query",
+            dense_candidates=max(52, DENSE_CANDIDATES),
+            lexical_candidates=max(52, LEXICAL_CANDIDATES),
+            rerank_candidates=max(RERANK_CANDIDATES, 24),
+            signals=signals,
+            language=language,
+        )
+    if question_form:
+        return QueryPlan(
+            strategy="dense-first",
+            dense_candidates=max(48, round(DENSE_CANDIDATES * 1.25)),
+            lexical_candidates=max(24, round(LEXICAL_CANDIDATES * 0.75)),
+            rerank_candidates=RERANK_CANDIDATES,
+            signals=signals,
+            language=language,
+        )
+    return QueryPlan(
+        strategy="balanced",
+        dense_candidates=DENSE_CANDIDATES,
+        lexical_candidates=LEXICAL_CANDIDATES,
+        rerank_candidates=RERANK_CANDIDATES,
+        signals=signals or ["general query"],
+        language=language,
+    )
+
+
+def fusion_confidence(candidates: Sequence[Candidate]) -> float:
+    """Estimate confidence from lane agreement and separation at the top."""
+
+    if not candidates:
+        return 0.0
+    top = candidates[:10]
+    agreement = sum(
+        item.vector_rank is not None and item.lexical_rank is not None for item in top
+    ) / len(top)
+    if len(candidates) == 1:
+        separation = 1.0
+    else:
+        best = max(float(candidates[0].fusion_score), 1e-9)
+        separation = min(
+            1.0,
+            max(0.0, (best - float(candidates[1].fusion_score)) / best) * 5.0,
+        )
+    return 0.7 * agreement + 0.3 * separation
 
 
 def retrieve_candidate_pool(
@@ -1336,13 +1765,15 @@ def retrieve_candidate_pool(
     question: str,
     source_filter: str | None = None,
     filters: RetrievalFilters | None = None,
+    query_plan: QueryPlan | None = None,
 ) -> tuple[list[Candidate], float, float]:
+    plan = query_plan or analyze_query(question)
     chroma_filter = {"source_id": source_filter} if source_filter else None
 
     dense_start = perf_counter()
     dense_results = runtime.vectorstore.similarity_search_with_score(
         query=question,
-        k=DENSE_CANDIDATES,
+        k=plan.dense_candidates,
         filter=chroma_filter,
     )
     dense_time = perf_counter() - dense_start
@@ -1351,7 +1782,7 @@ def retrieve_candidate_pool(
     lexical_results = lexical_search(
         path=LEXICAL_DB_PATH,
         question=question,
-        limit=LEXICAL_CANDIDATES,
+        limit=plan.lexical_candidates,
         source_id=source_filter,
     )
     lexical_documents = documents_by_id(
@@ -1407,7 +1838,45 @@ def retrieve_candidate_pool(
     )
     for rank, candidate in enumerate(ranked, start=1):
         candidate.retrieval_rank = rank
+    plan.fusion_confidence = fusion_confidence(ranked)
     return ranked, dense_time, lexical_time
+
+
+def retrieve_candidates_with_plan(
+    runtime: Runtime,
+    question: str,
+    source_filter: str | None = None,
+    filters: RetrievalFilters | None = None,
+    rerank_candidate_override: int | None = None,
+) -> tuple[list[Candidate], float, float, QueryPlan]:
+    """Return an adaptive shortlist plus the allocation explanation."""
+
+    plan = analyze_query(question)
+    pool, dense_time, lexical_time = retrieve_candidate_pool(
+        runtime,
+        question,
+        source_filter,
+        filters,
+        plan,
+    )
+    if rerank_candidate_override is not None:
+        plan.rerank_candidates = max(1, min(80, int(rerank_candidate_override)))
+        plan.signals.append("production experiment configuration")
+    elif plan.fusion_confidence < 0.35:
+        plan.rerank_candidates = max(
+            plan.rerank_candidates,
+            min(32, max(RERANK_CANDIDATES + 8, round(RERANK_CANDIDATES * 1.5))),
+        )
+        plan.signals.append("low fusion confidence")
+    elif plan.fusion_confidence >= 0.7:
+        plan.rerank_candidates = max(12, min(plan.rerank_candidates, RERANK_CANDIDATES))
+        plan.signals.append("high fusion confidence")
+    return (
+        pool[: plan.rerank_candidates],
+        dense_time,
+        lexical_time,
+        plan,
+    )
 
 
 def retrieve_candidates(
@@ -1418,26 +1887,58 @@ def retrieve_candidates(
 ) -> tuple[list[Candidate], float, float]:
     """Return the fused shortlist that will be scored by the cross-encoder."""
 
-    pool, dense_time, lexical_time = retrieve_candidate_pool(
+    pool, dense_time, lexical_time, _ = retrieve_candidates_with_plan(
         runtime,
         question,
         source_filter,
         filters,
     )
-    return pool[:RERANK_CANDIDATES], dense_time, lexical_time
+    return pool, dense_time, lexical_time
 
 
 def rerank_candidates(
     runtime: Runtime,
     question: str,
     candidates: list[Candidate],
+    rerank_weight: float | None = None,
+    passage_mode: str = "metadata-child",
 ) -> list[Candidate]:
+    if runtime.reranker is None:
+        raise RuntimeError("No reranker is loaded.")
     pairs = [
-        (question, build_rerank_passage(candidate.document))
+        (question, build_rerank_passage(candidate.document, passage_mode))
         for candidate in candidates
     ]
-    with runtime.inference_lock:
-        scores = runtime.reranker.predict(pairs)
+    try:
+        with runtime.inference_lock:
+            scores = runtime.reranker.predict(pairs)
+    except RerankerWorkerError as error:
+        worker = runtime.reranker
+        if error.recovered and isinstance(worker, RerankerWorkerClient):
+            _RERANKER_FATAL.clear()
+            _set_reranker_state(
+                status="ready",
+                choice=worker.choice,
+                model=worker.model_name,
+                device=worker.device,
+                message=(
+                    "The GPU worker recovered from an inference failure. "
+                    "Retry the search."
+                ),
+                worker_pid=worker.pid,
+                worker_restarts=worker.restart_count,
+            )
+            raise RerankerUnavailableError(str(error)) from error
+        _mark_reranker_failure(error, getattr(runtime, "reranker_choice", RERANKER_CHOICE))
+        raise RerankerUnavailableError(str(error)) from error
+    except RuntimeError as error:
+        _mark_reranker_failure(error, runtime.reranker_choice)
+        if _is_fatal_cuda_error(error):
+            raise RerankerUnavailableError(
+                "The GPU reranker encountered a fatal CUDA error. Restart the "
+                "server; retrying in this process is unsafe."
+            ) from error
+        raise
 
     for candidate, (logit, probability, token_count, truncated) in zip(
         candidates,
@@ -1448,7 +1949,25 @@ def rerank_candidates(
         candidate.rerank_probability = probability
         candidate.rerank_token_count = token_count
         candidate.rerank_truncated = truncated
+        candidate.reranker_choice = getattr(
+            runtime.reranker,
+            "choice",
+            RERANKER_CHOICE,
+        )
+        candidate.reranker_model = getattr(
+            runtime.reranker,
+            "model_name",
+            RERANKER_MODEL,
+        )
+        candidate.reranker_fingerprint = getattr(
+            runtime.reranker,
+            "fingerprint",
+            reranker_fingerprint(candidate.reranker_choice),
+        )
 
+    active_weight = RERANK_WEIGHT if rerank_weight is None else float(rerank_weight)
+    if not 0.0 <= active_weight <= 1.0:
+        raise ValueError("rerank_weight must be between 0 and 1")
     cross_encoder_ranked = sorted(
         candidates,
         key=lambda item: item.rerank_logit,
@@ -1459,8 +1978,8 @@ def rerank_candidates(
         rerank_component = 1.0 / (RRF_K + rank)
         retrieval_component = 1.0 / (RRF_K + candidate.retrieval_rank)
         candidate.final_score = (
-            RERANK_WEIGHT * rerank_component
-            + (1.0 - RERANK_WEIGHT) * retrieval_component
+            active_weight * rerank_component
+            + (1.0 - active_weight) * retrieval_component
         )
 
     final_ranked = sorted(
@@ -1473,17 +1992,22 @@ def rerank_candidates(
     return final_ranked
 
 
-def relevance_gate_thresholds() -> tuple[float, float, str] | None:
+def relevance_gate_thresholds(
+    reranker_choice: str | None = None,
+) -> tuple[float, float, str] | None:
     """Return live best/result cutoffs and their source, if gating is active."""
 
     if ENABLE_RELEVANCE_GATE:
         return MIN_BEST_RERANK_LOGIT, MIN_RESULT_RERANK_LOGIT, "environment"
     try:
+        configuration = reranker_configuration(reranker_choice)
         calibration = WORKSPACE_STORE.calibration_status(
             min_positive=QUALITY_MIN_POSITIVE_LABELS,
             min_negative=QUALITY_MIN_NEGATIVE_LABELS,
-            reranker_model=RERANKER_MODEL,
-            reranker_fingerprint=reranker_fingerprint(),
+            reranker_model=str(configuration["model"]),
+            reranker_fingerprint=reranker_fingerprint(
+                str(configuration["choice"])
+            ),
         )
     except Exception:
         LOGGER.exception("Could not read the reference-quality calibration")
@@ -1495,24 +2019,38 @@ def relevance_gate_thresholds() -> tuple[float, float, str] | None:
     return learned, learned, "feedback"
 
 
-def select_results(ranked: list[Candidate]) -> list[Candidate]:
+def select_results(
+    ranked: list[Candidate],
+    reranker_choice: str | None = None,
+) -> list[Candidate]:
     if not ranked:
         return []
-    gate = relevance_gate_thresholds()
+    for candidate in ranked:
+        candidate.selection_reason = ""
+        candidate.exclusion_reason = ""
+        candidate.found_by = candidate.found_by or candidate_found_by(candidate)
+    selected_choice = reranker_choice or ranked[0].reranker_choice
+    gate = relevance_gate_thresholds(selected_choice)
     if (
         gate is not None
         and max(candidate.rerank_logit for candidate in ranked) < gate[0]
     ):
+        for candidate in ranked:
+            candidate.exclusion_reason = "Below the overall relevance threshold"
         return []
 
     selected: list[Candidate] = []
     section_counts: dict[tuple[str, str], int] = {}
     page_counts: dict[tuple[str, int], int] = {}
     for candidate in ranked:
+        if len(selected) >= RERANK_TOP_N:
+            candidate.exclusion_reason = "Top result limit"
+            continue
         if (
             gate is not None
             and candidate.rerank_logit < gate[1]
         ):
+            candidate.exclusion_reason = "Below the relevance threshold"
             continue
         metadata = candidate.document.metadata
         section_key = (
@@ -1520,30 +2058,38 @@ def select_results(ranked: list[Candidate]) -> list[Candidate]:
             str(metadata.get("section_path", "")),
         )
         if section_counts.get(section_key, 0) >= MAX_RESULTS_PER_SECTION:
+            candidate.exclusion_reason = "Section diversity limit"
             continue
         page = first_source_page(metadata)
         page_key = (str(metadata.get("source_id", "")), page or -1)
         if page is not None and page_counts.get(page_key, 0) >= MAX_RESULTS_PER_PAGE:
+            candidate.exclusion_reason = "Page diversity limit"
             continue
         if any(results_are_near_duplicates(candidate, item) for item in selected):
+            candidate.exclusion_reason = "Near-duplicate passage"
             continue
         section_counts[section_key] = section_counts.get(section_key, 0) + 1
         if page is not None:
             page_counts[page_key] = page_counts.get(page_key, 0) + 1
         selected.append(candidate)
-        if len(selected) >= RERANK_TOP_N:
-            break
+        candidate.selection_reason = "Strongest unique passage from this section"
+        candidate.exclusion_reason = ""
     return selected
 
 
 def select_additional_results(
     ranked: Sequence[Candidate],
     selected: Sequence[Candidate],
+    reranker_choice: str | None = None,
 ) -> list[Candidate]:
     """Return further unique reranked passages without rerunning inference."""
 
     selected_ids = {candidate.chunk_id for candidate in selected}
-    gate = relevance_gate_thresholds()
+    selected_choice = (
+        reranker_choice
+        or (ranked[0].reranker_choice if ranked else RERANKER_CHOICE)
+    )
+    gate = relevance_gate_thresholds(selected_choice)
     accepted = list(selected)
     additional: list[Candidate] = []
     for candidate in ranked:
@@ -1553,17 +2099,31 @@ def select_additional_results(
             gate is not None
             and candidate.rerank_logit < gate[1]
         ):
+            candidate.exclusion_reason = "Below the relevance threshold"
             continue
         if any(results_are_near_duplicates(candidate, item) for item in accepted):
+            candidate.exclusion_reason = "Near-duplicate passage"
             continue
         accepted.append(candidate)
         additional.append(candidate)
+        candidate.selection_reason = "Additional unique context"
+        candidate.exclusion_reason = ""
         if len(additional) >= ADDITIONAL_RESULTS:
             break
     return additional
 
 
 RESULT_WORD_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def candidate_found_by(candidate: Candidate) -> str:
+    if candidate.vector_rank is not None and candidate.lexical_rank is not None:
+        return "dense + lexical retrieval"
+    if candidate.vector_rank is not None:
+        return "dense retrieval"
+    if candidate.lexical_rank is not None:
+        return "lexical retrieval"
+    return "search within earlier results"
 
 
 def context_text(document: Document) -> str:
@@ -2931,8 +3491,12 @@ def candidate_feedback_payload(
         "result_rank": candidate.final_rank,
         "rerank_logit": candidate.rerank_logit,
         "final_score": candidate.final_score,
-        "reranker_model": RERANKER_MODEL,
-        "reranker_fingerprint": reranker_fingerprint(),
+        "reranker_choice": candidate.reranker_choice,
+        "reranker_model": candidate.reranker_model,
+        "reranker_fingerprint": (
+            candidate.reranker_fingerprint
+            or reranker_fingerprint(candidate.reranker_choice)
+        ),
         **(context or {}),
     }
 
@@ -3098,6 +3662,7 @@ def _search_with_additional_unlocked(
     source_filter: str | None = None,
     filters: RetrievalFilters | None = None,
     within_result_ids: Sequence[str] | None = None,
+    reranker_choice: str | None = None,
 ) -> tuple[
     str,
     str,
@@ -3109,31 +3674,86 @@ def _search_with_additional_unlocked(
     if not question:
         return "Enter a query.", "", [], [], {}
 
-    runtime = get_runtime()
     total_start = perf_counter()
+    runtime = get_runtime()
+    production_experiment = WORKSPACE_STORE.production_experiment()
+    production_config = (
+        dict(production_experiment.get("config") or {})
+        if production_experiment
+        else {}
+    )
+    production_choice = str(production_config.get("reranker") or "")
+    if production_choice not in RERANKER_PRESETS:
+        production_choice = RERANKER_CHOICE
+    requested_choice = resolve_reranker_choice(
+        reranker_choice or production_choice
+    )
+    model_was_loaded = (
+        runtime.reranker is not None
+        and runtime.reranker_choice == requested_choice
+    )
+    active_reranker = select_runtime_reranker(runtime, requested_choice)
     normalized_source = normalize_source_filter(source_filter)
+    production_candidate_count = production_config.get("candidate_count")
+    production_rerank_weight = production_config.get("rerank_weight")
+    production_passage_mode = str(
+        production_config.get("passage_mode") or "metadata-child"
+    )
+    query_plan = analyze_query(question, within_results=bool(within_result_ids))
+    if within_result_ids and production_candidate_count is not None:
+        query_plan.rerank_candidates = min(
+            query_plan.rerank_candidates,
+            max(1, int(production_candidate_count)),
+        )
     if within_result_ids:
         candidates = candidates_from_ids(
             runtime.collection,
             within_result_ids,
             filters,
             normalized_source,
+            query_plan.rerank_candidates,
         )
         dense_time = 0.0
         lexical_time = 0.0
     else:
-        candidates, dense_time, lexical_time = retrieve_candidates(
+        candidates, dense_time, lexical_time, query_plan = retrieve_candidates_with_plan(
             runtime=runtime,
             question=question,
             source_filter=normalized_source,
             filters=filters,
+            rerank_candidate_override=(
+                int(production_candidate_count)
+                if production_candidate_count is not None
+                else None
+            ),
         )
 
     rerank_start = perf_counter()
-    ranked = rerank_candidates(runtime, question, candidates)
+    ranked = rerank_candidates(
+        runtime,
+        question,
+        candidates,
+        rerank_weight=(
+            float(production_rerank_weight)
+            if production_rerank_weight is not None
+            else None
+        ),
+        passage_mode=production_passage_mode,
+    )
     rerank_time = perf_counter() - rerank_start
-    selected = select_results(ranked)
-    additional = select_additional_results(ranked, selected)
+    selected = select_results(ranked, active_reranker.choice)
+    additional = select_additional_results(
+        ranked,
+        selected,
+        active_reranker.choice,
+    )
+    displayed_ids = {candidate.chunk_id for candidate in [*selected, *additional]}
+    hidden_reasons: dict[str, int] = {}
+    for candidate in ranked:
+        if candidate.chunk_id in displayed_ids:
+            continue
+        reason = candidate.exclusion_reason or "Result display limit"
+        hidden_reasons[reason] = hidden_reasons.get(reason, 0) + 1
     total_time = perf_counter() - total_start
 
     timings = SearchTimings(
@@ -3161,6 +3781,9 @@ def _search_with_additional_unlocked(
         "dense_seconds": dense_time,
         "lexical_seconds": lexical_time,
         "rerank_seconds": rerank_time,
+        "model_load_seconds": (
+            0.0 if model_was_loaded else float(active_reranker.load_seconds)
+        ),
         "total_seconds": total_time,
         "reranker_truncation_rate": (
             sum(candidate.rerank_truncated for candidate in ranked) / len(ranked)
@@ -3173,6 +3796,15 @@ def _search_with_additional_unlocked(
             else None
         ),
         "considered_count": len(ranked),
+        "reranker_choice": active_reranker.choice,
+        "reranker_model": active_reranker.model_name,
+        "reranker_fingerprint": active_reranker.fingerprint,
+        "reranker_device": str(active_reranker.device),
+        "retrieval_plan": query_plan.as_dict(),
+        "production_experiment_id": (
+            int(production_experiment["id"]) if production_experiment else None
+        ),
+        "hidden_reasons": hidden_reasons,
     }
     return output, additional_output, selected, additional, metrics
 
@@ -3182,6 +3814,7 @@ def search_with_additional(
     source_filter: str | None = None,
     filters: RetrievalFilters | None = None,
     within_result_ids: Sequence[str] | None = None,
+    reranker_choice: str | None = None,
 ) -> tuple[
     str,
     str,
@@ -3205,6 +3838,7 @@ def search_with_additional(
             source_filter,
             filters,
             within_result_ids,
+            reranker_choice,
         )
 
 
@@ -3373,6 +4007,7 @@ def candidate_api_payload(
         if page_end and page_end != page_start:
             page_label = f"pages {page_start}-{page_end}"
     citation_parts = [metadata["document_title"], section, page_label]
+    found_by = candidate.found_by or candidate_found_by(candidate)
     return {
         "chunk_id": candidate.chunk_id,
         "source_id": metadata["source_id"],
@@ -3390,11 +4025,24 @@ def candidate_api_payload(
         "rerank_logit": candidate.rerank_logit,
         "rerank_probability": candidate.rerank_probability,
         "final_score": candidate.final_score,
+        "fusion_score": candidate.fusion_score,
         "retrieval_rank": candidate.retrieval_rank,
         "rerank_rank": candidate.rerank_rank,
         "dense_rank": candidate.vector_rank,
+        "dense_distance": candidate.vector_distance,
         "lexical_rank": candidate.lexical_rank,
+        "lexical_score": candidate.lexical_score,
+        "rerank_token_count": candidate.rerank_token_count,
         "rerank_truncated": candidate.rerank_truncated,
+        "explanation": {
+            "found_by": found_by,
+            "fusion_position": candidate.retrieval_rank or None,
+            "reranker_position": candidate.rerank_rank or None,
+            "selected_because": (
+                candidate.selection_reason
+                or "Highest relevance score among the displayed passages"
+            ),
+        },
         "feedback": candidate_feedback_payload(
             question,
             candidate,
@@ -3740,6 +4388,384 @@ def frontend_page(fallback_html: str) -> Response:
     return HTMLResponse(fallback_html, headers={"Cache-Control": "no-store"})
 
 
+def _benchmark_cases_from_content(content: str) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for line in content.splitlines():
+        if line.strip():
+            value = json.loads(line)
+            if isinstance(value, dict):
+                cases.append(value)
+    if not cases:
+        raise ValueError("The selected benchmark has no cases.")
+    return cases
+
+
+def _benchmark_signature(cases: Sequence[dict[str, Any]]) -> str:
+    """Hash the exact evaluated cases so baselines cannot drift silently."""
+
+    payload = json.dumps(
+        list(cases),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _configured_reranker_choices(value: object) -> tuple[str, ...]:
+    requested = str(value or "gte")
+    return ("gte", "bge") if requested == "both" else (
+        resolve_reranker_choice(requested),
+    )
+
+
+def _run_quality_experiment(
+    experiment_id: int,
+    cases: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> None:
+    """Execute one saved experiment without tying up an HTTP request."""
+
+    try:
+        WORKSPACE_STORE.update_experiment(experiment_id, status="running")
+        # Import lazily to avoid evaluate.py's intentional import of this module
+        # becoming a startup cycle.
+        from evaluate import evaluate, retrieve_evaluation_candidates
+
+        with _SEARCH_MAINTENANCE_LOCK:
+            cache = retrieve_evaluation_candidates(cases)
+            choices = _configured_reranker_choices(config.get("reranker"))
+            models: dict[str, Any] = {}
+            for choice in choices:
+                summary, rows = evaluate(
+                    cases,
+                    reranker_choice=choice,
+                    candidate_count=int(config["candidate_count"]),
+                    rerank_weight=float(config["rerank_weight"]),
+                    passage_mode=str(config["passage_mode"]),
+                    candidate_cache=cache,
+                )
+                models[choice] = {
+                    "summary": summary,
+                    "failed_queries": [
+                        row["query"]
+                        for row in rows
+                        if row.get("answerable") and not row.get("selected_recall")
+                    ][:50],
+                }
+            runtime = get_runtime()
+            select_runtime_reranker(
+                runtime,
+                configured_default_reranker_choice(),
+            )
+        regression = {
+            "passed": True,
+            "threshold": float(config.get("max_ndcg_drop", 0.03)),
+            "baseline_experiment_id": config.get("baseline_experiment_id"),
+            "comparisons": {},
+        }
+        baseline_id = config.get("baseline_experiment_id")
+        if baseline_id:
+            baseline = WORKSPACE_STORE.get_experiment(int(baseline_id))
+            baseline_config = baseline.get("config") or {}
+            if baseline_config.get("benchmark_signature") != config.get(
+                "benchmark_signature"
+            ):
+                raise RuntimeError(
+                    "The regression baseline evaluated a different benchmark or split."
+                )
+            baseline_models = (baseline.get("results") or {}).get("models") or {}
+            missing_models = sorted(set(models) - set(baseline_models))
+            if missing_models:
+                raise RuntimeError(
+                    "The regression baseline is missing model results for: "
+                    + ", ".join(missing_models)
+                )
+            for choice, model_result in models.items():
+                current_ndcg = float(model_result["summary"].get("ndcg_at_5") or 0.0)
+                baseline_ndcg = float(
+                    baseline_models[choice].get("summary", {}).get("ndcg_at_5") or 0.0
+                )
+                drop = baseline_ndcg - current_ndcg
+                passed = drop <= regression["threshold"] + 1e-12
+                regression["comparisons"][choice] = {
+                    "baseline_ndcg_at_5": baseline_ndcg,
+                    "current_ndcg_at_5": current_ndcg,
+                    "drop": drop,
+                    "passed": passed,
+                }
+                regression["passed"] = bool(regression["passed"] and passed)
+        WORKSPACE_STORE.update_experiment(
+            experiment_id,
+            status="complete",
+            results={
+                "models": models,
+                "regression": regression,
+                "completed_at": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+        WORKSPACE_STORE.add_notification(
+            kind="experiment",
+            title="Quality experiment complete",
+            message=(
+                "All regression checks passed."
+                if regression["passed"]
+                else "The experiment exceeded its allowed nDCG regression."
+            ),
+            status="success" if regression["passed"] else "warning",
+            task_key=f"experiment:{experiment_id}",
+        )
+    except Exception as error:
+        LOGGER.exception("Quality experiment %s failed", experiment_id)
+        try:
+            WORKSPACE_STORE.update_experiment(
+                experiment_id,
+                status="failed",
+                error=f"{type(error).__name__}: {error}",
+            )
+            WORKSPACE_STORE.add_notification(
+                kind="experiment",
+                title="Quality experiment failed",
+                message="Open the experiment for the error details.",
+                status="error",
+                task_key=f"experiment:{experiment_id}",
+            )
+        except Exception:
+            LOGGER.exception("Could not persist experiment failure")
+    finally:
+        _EXPERIMENT_ACTIVE.clear()
+
+
+def start_quality_experiment(payload: dict[str, Any]) -> dict[str, Any]:
+    if _EXPERIMENT_ACTIVE.is_set():
+        raise RuntimeError("Another quality experiment is already running.")
+    reranker = str(payload.get("reranker") or "both").strip().lower()
+    if reranker not in {"gte", "bge", "both"}:
+        raise ValueError("reranker must be gte, bge, or both")
+    candidate_count = int(payload.get("candidate_count") or RERANK_CANDIDATES)
+    rerank_weight = float(payload.get("rerank_weight", RERANK_WEIGHT))
+    passage_mode = str(payload.get("passage_mode") or "metadata-child")
+    split = str(payload.get("split") or "all").strip().lower()
+    baseline_experiment_id = payload.get("baseline_experiment_id") or None
+    max_ndcg_drop = float(payload.get("max_ndcg_drop", 0.03))
+    if not 1 <= candidate_count <= 80:
+        raise ValueError("candidate_count must be between 1 and 80")
+    if not 0.0 <= rerank_weight <= 1.0:
+        raise ValueError("rerank_weight must be between 0 and 1")
+    if passage_mode not in {
+        "child",
+        "metadata-child",
+        "metadata-parent",
+        "metadata-child-parent",
+    }:
+        raise ValueError("Unsupported passage mode")
+    if split not in {"all", "calibration", "test"}:
+        raise ValueError("split must be all, calibration, or test")
+    if not 0.0 <= max_ndcg_drop <= 1.0:
+        raise ValueError("max_ndcg_drop must be between 0 and 1")
+    benchmark_key = str(payload.get("benchmark_key") or "feedback:gte")
+    benchmark_id: int | None = None
+    if benchmark_key.startswith("stored:"):
+        benchmark_id = int(benchmark_key.split(":", 1)[1])
+        benchmark = WORKSPACE_STORE.get_benchmark(benchmark_id, include_content=True)
+        benchmark_name = f"{benchmark['name']} v{benchmark['version']}"
+        cases = _benchmark_cases_from_content(str(benchmark["content_jsonl"]))
+    elif benchmark_key.startswith("feedback:"):
+        feedback_choice = resolve_reranker_choice(benchmark_key.split(":", 1)[1])
+        benchmark_name = f"Feedback labels ({feedback_choice.upper()})"
+        cases = WORKSPACE_STORE.benchmark_cases_from_feedback(
+            reranker_fingerprint(feedback_choice)
+        )
+        if not cases:
+            raise ValueError("The selected feedback benchmark has no complete cases yet.")
+    else:
+        raise ValueError("Select a valid benchmark")
+
+    if split != "all":
+        cases = [case for case in cases if str(case.get("split") or "test") == split]
+        benchmark_name = f"{benchmark_name} · {split} split"
+        if not cases:
+            raise ValueError(f"The selected benchmark has no {split} cases.")
+
+    benchmark_signature = _benchmark_signature(cases)
+    if baseline_experiment_id is not None:
+        baseline = WORKSPACE_STORE.get_experiment(int(baseline_experiment_id))
+        if baseline["status"] != "complete":
+            raise ValueError("The regression baseline must be a completed experiment.")
+        baseline_config = baseline.get("config") or {}
+        if baseline_config.get("benchmark_signature") != benchmark_signature:
+            raise ValueError(
+                "The regression baseline must use the same benchmark version and split."
+            )
+        baseline_models = (baseline.get("results") or {}).get("models") or {}
+        required_models = set(_configured_reranker_choices(reranker))
+        missing_models = sorted(required_models - set(baseline_models))
+        if missing_models:
+            raise ValueError(
+                "The regression baseline has no compatible result for: "
+                + ", ".join(missing_models)
+            )
+
+    config = {
+        "reranker": reranker,
+        "candidate_count": candidate_count,
+        "rerank_weight": rerank_weight,
+        "passage_mode": passage_mode,
+        "split": split,
+        "benchmark_key": benchmark_key,
+        "benchmark_signature": benchmark_signature,
+        "baseline_experiment_id": (
+            int(baseline_experiment_id) if baseline_experiment_id is not None else None
+        ),
+        "max_ndcg_drop": max_ndcg_drop,
+    }
+    experiment = WORKSPACE_STORE.create_experiment(
+        str(payload.get("name") or "").strip(),
+        benchmark_id,
+        benchmark_name,
+        config,
+    )
+    with _EXPERIMENT_LOCK:
+        if _EXPERIMENT_ACTIVE.is_set():
+            WORKSPACE_STORE.update_experiment(
+                int(experiment["id"]),
+                status="failed",
+                error="Another quality experiment is already running.",
+            )
+            raise RuntimeError("Another quality experiment is already running.")
+        _EXPERIMENT_ACTIVE.set()
+    threading.Thread(
+        target=_run_quality_experiment,
+        args=(int(experiment["id"]), cases, config),
+        name=f"quality-experiment-{experiment['id']}",
+        daemon=True,
+    ).start()
+    return experiment
+
+
+def diagnostic_bundle() -> bytes:
+    """Create a local, privacy-safe support archive without document content."""
+
+    from importlib.metadata import PackageNotFoundError, version
+
+    def package_versions() -> dict[str, str]:
+        output: dict[str, str] = {}
+        for name in ("torch", "transformers", "chromadb", "docling", "fastapi"):
+            try:
+                output[name] = version(name)
+            except PackageNotFoundError:
+                output[name] = "not installed"
+        return output
+
+    health = CORPUS_SCALE.health()
+    safe_health = {
+        key: health.get(key)
+        for key in (
+            "status",
+            "generated_at",
+            "documents",
+            "pages",
+            "chunks",
+            "indexed",
+            "pending",
+            "quarantined",
+            "revisions",
+            "storage",
+        )
+    }
+    safe_health["issues"] = [
+        {
+            "severity": item.get("severity"),
+            "label": item.get("label"),
+            "count": item.get("count"),
+        }
+        for item in health.get("issues", [])
+        if isinstance(item, dict)
+    ]
+    queue = CORPUS_SCALE.snapshot()
+    safe_queue = {
+        "paused": bool(queue.get("paused")),
+        "remaining": int(queue.get("remaining") or 0),
+        "counts": queue.get("counts") or {},
+        "updated_at": queue.get("updated_at"),
+    }
+    reranker = reranker_runtime_status()
+    safe_reranker = {
+        key: reranker.get(key)
+        for key in (
+            "status",
+            "choice",
+            "label",
+            "model",
+            "device",
+            "load_seconds",
+            "preflight_tokens",
+            "restart_required",
+            "worker_pid",
+            "worker_restarts",
+            "worker_alive",
+            "updated_at",
+        )
+    }
+    manifest = DOCUMENT_REPOSITORY._read_json(MANIFEST_PATH, {})
+    document_state = DOCUMENT_REPOSITORY._read_json(DOCUMENT_REPOSITORY.state_path, {})
+    corpus_state = DOCUMENT_REPOSITORY._read_json(CORPUS_SCALE.state_path, {})
+    payloads = {
+        "settings.json": {
+            "embedding_model": EMBEDDING_MODEL,
+            "reranker_default": RERANKER_CHOICE,
+            "reranker_presets": {
+                key: str(value.get("model") or "")
+                for key, value in RERANKER_PRESETS.items()
+            },
+            "dense_candidates": DENSE_CANDIDATES,
+            "lexical_candidates": LEXICAL_CANDIDATES,
+            "rerank_candidates": RERANK_CANDIDATES,
+            "rerank_top_n": RERANK_TOP_N,
+            "search_during_ingestion": SEARCH_DURING_INGESTION,
+        },
+        "packages.json": package_versions(),
+        "hardware.json": HARDWARE.as_dict(),
+        "reranker.json": safe_reranker,
+        "corpus.json": safe_health,
+        "queue.json": safe_queue,
+        "migrations.json": {
+            "workspace": WORKSPACE_STORE.schema_status(),
+            "document_state_version": int(document_state.get("version") or 1),
+            "corpus_state_version": int(corpus_state.get("version") or 1),
+            "manifest_schema_version": int(manifest.get("version") or 1),
+        },
+        "recent_errors.json": [
+            {
+                "kind": item.get("kind"),
+                "title": item.get("title"),
+                "status": item.get("status"),
+                "created_at": item.get("created_at"),
+            }
+            for item in WORKSPACE_STORE.list_notifications(limit=30)
+            if item.get("status") == "error"
+        ],
+        "privacy.json": {
+            "included": "configuration, versions, aggregate health, and generic errors",
+            "excluded": [
+                "PDF files",
+                "document paths and titles",
+                "passage excerpts",
+                "search queries",
+                "feedback text",
+            ],
+        },
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename, payload in payloads.items():
+            archive.writestr(
+                filename,
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            )
+    return output.getvalue()
+
+
 def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
     """Create the FastAPI backend and serve the React UI when built."""
 
@@ -3756,6 +4782,104 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             }
         except DocumentMaintenanceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/rerankers", include_in_schema=False)
+    def list_rerankers() -> dict[str, Any]:
+        return {
+            "default": configured_default_reranker_choice(),
+            "status": reranker_runtime_status(),
+            "options": [
+                {
+                    "value": choice,
+                    "label": str(preset["label"]),
+                    "description": str(preset["description"]),
+                    "model": str(preset["model"]),
+                }
+                for choice, preset in RERANKER_PRESETS.items()
+            ],
+        }
+
+    @app.get("/api/rerankers/status", include_in_schema=False)
+    def reranker_status() -> dict[str, Any]:
+        return reranker_runtime_status()
+
+    @app.get("/api/notifications", include_in_schema=False)
+    def notifications(unread_only: bool = False) -> dict[str, Any]:
+        items = WORKSPACE_STORE.list_notifications(
+            limit=80,
+            unread_only=unread_only,
+        )
+        return {
+            "notifications": items,
+            "unread_count": sum(item.get("read_at") is None for item in items),
+        }
+
+    @app.post("/api/notifications/{notification_id}/read", include_in_schema=False)
+    def read_notification(notification_id: int) -> dict[str, Any]:
+        try:
+            return WORKSPACE_STORE.mark_notification_read(notification_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Notification not found") from error
+
+    @app.get("/api/diagnostics/export", include_in_schema=False)
+    def export_diagnostics() -> Response:
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
+        return Response(
+            content=diagnostic_bundle(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="reference-desk-diagnostics-{stamp}.zip"'
+                )
+            },
+        )
+
+    @app.post("/api/rerankers/restart", include_in_schema=False)
+    async def restart_reranker(request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        try:
+            choice = resolve_reranker_choice(
+                str(payload.get("reranker_choice") or RERANKER_CHOICE)
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        try:
+            runtime = get_runtime()
+            with runtime.inference_lock:
+                active = select_runtime_reranker(runtime, choice)
+                if isinstance(active, RerankerWorkerClient):
+                    _set_reranker_state(
+                        status="loading",
+                        choice=choice,
+                        message=f"Restarting {choice.upper()} GPU worker…",
+                    )
+                    active.restart()
+                    _RERANKER_FATAL.clear()
+                    _set_reranker_state(
+                        status="ready",
+                        choice=active.choice,
+                        model=active.model_name,
+                        device=active.device,
+                        message=f"{choice.upper()} worker restarted and is ready.",
+                        load_seconds=active.load_seconds,
+                        preflight_tokens=active.preflight_tokens,
+                        worker_pid=active.pid,
+                        worker_restarts=active.restart_count,
+                    )
+                    _notify(
+                        kind="reranker",
+                        title=f"{choice.upper()} worker restarted",
+                        message="The reranker is ready for search.",
+                        status="success",
+                        task_key=f"reranker:{choice}",
+                    )
+        except (RerankerWorkerError, RuntimeError) as error:
+            _mark_reranker_failure(error, choice)
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return reranker_runtime_status()
 
     @app.post("/api/search", include_in_schema=False)
     async def search_documents_api(request: Request) -> dict[str, Any]:
@@ -3776,14 +4900,26 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             if str(item).strip()
         ]
         try:
+            requested_reranker = str(payload.get("reranker_choice") or "").strip()
+            reranker_choice = (
+                resolve_reranker_choice(requested_reranker)
+                if requested_reranker
+                else None
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        try:
             _, _, selected, additional, metrics = search_with_additional(
                 question,
                 source_filter,
                 filters=filters,
                 within_result_ids=(previous_ids if within_results else None),
+                reranker_choice=reranker_choice,
             )
         except DocumentMaintenanceError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except RerankerUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except Exception as error:
             LOGGER.exception("Search API failed")
             raise HTTPException(
@@ -3803,9 +4939,26 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             len(result_ids),
         )
         context = feedback_context(source_filter, filters)
-        gate = relevance_gate_thresholds()
+        active_choice = str(
+            metrics.get("reranker_choice") or reranker_choice or RERANKER_CHOICE
+        )
+        active_configuration = reranker_configuration(active_choice)
+        active_model = str(
+            metrics.get("reranker_model") or active_configuration["model"]
+        )
+        active_fingerprint = str(
+            metrics.get("reranker_fingerprint")
+            or reranker_fingerprint(active_choice)
+        )
+        gate = relevance_gate_thresholds(active_choice)
         return {
             "query": question,
+            "reranker": {
+                "choice": active_choice,
+                "label": str(active_configuration["label"]),
+                "model": active_model,
+                "fingerprint": active_fingerprint,
+            },
             "results": [
                 candidate_api_payload(question, candidate, context)
                 for candidate in selected
@@ -3830,6 +4983,9 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
                 "query": question,
                 "chunk_id": "",
                 "rerank_logit": metrics.get("best_rerank_logit"),
+                "reranker_choice": active_choice,
+                "reranker_model": active_model,
+                "reranker_fingerprint": active_fingerprint,
                 **context,
             },
         }
@@ -3845,6 +5001,8 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
     @app.get("/documents/api/list", include_in_schema=False)
     def list_managed_documents() -> dict[str, Any]:
         payload = DOCUMENT_REPOSITORY.summary()
+        if CORPUS_SCALE.repository is DOCUMENT_REPOSITORY:
+            CORPUS_SCALE.reconcile_indexed_documents(payload)
         payload["job"] = document_job_snapshot()
         payload["app_instance_id"] = _APP_INSTANCE_ID
         payload["hardware"] = HARDWARE.as_dict()
@@ -4105,7 +5263,15 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         try:
             with _SEARCH_MAINTENANCE_LOCK:
                 _release_search_runtime()
-                return CORPUS_SCALE.create_backup(str(payload.get("label") or ""))
+                result = CORPUS_SCALE.create_backup(str(payload.get("label") or ""))
+                _notify(
+                    kind="backup",
+                    title="Corpus backup complete",
+                    message="The local corpus snapshot is ready.",
+                    status="success",
+                    task_key="corpus-backup",
+                )
+                return result
         except (OSError, sqlite3.Error, zipfile.BadZipFile) as error:
             LOGGER.exception("Corpus backup failed")
             raise HTTPException(status_code=500, detail=f"Backup failed: {error}") from error
@@ -4127,6 +5293,13 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
                 _release_search_runtime()
                 result = CORPUS_SCALE.restore_backup(backup_id)
                 _APP_INSTANCE_ID = token_urlsafe(8)
+                _notify(
+                    kind="backup",
+                    title="Corpus backup restored",
+                    message="Search models will reload on the next query.",
+                    status="success",
+                    task_key="corpus-restore",
+                )
                 return result
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail="Backup not found.") from error
@@ -4151,6 +5324,74 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         return {"deleted": True}
 
     @app.get(
+        "/experiments",
+        response_class=Response,
+        include_in_schema=False,
+    )
+    def experiments_page() -> Response:
+        return frontend_page("<h1>Evaluation experiments</h1>")
+
+    @app.get("/quality/api/experiments", include_in_schema=False)
+    def quality_experiment_state() -> dict[str, Any]:
+        feedback_benchmarks = []
+        for choice in ("gte", "bge"):
+            cases = WORKSPACE_STORE.benchmark_cases_from_feedback(
+                reranker_fingerprint(choice)
+            )
+            feedback_benchmarks.append(
+                {
+                    "key": f"feedback:{choice}",
+                    "name": f"Feedback labels ({choice.upper()})",
+                    "version": 1,
+                    "case_count": len(cases),
+                    "kind": "feedback",
+                }
+            )
+        stored = [
+            {**item, "key": f"stored:{item['id']}", "kind": "imported"}
+            for item in WORKSPACE_STORE.list_benchmarks()
+        ]
+        return {
+            "benchmarks": [*feedback_benchmarks, *stored],
+            "experiments": WORKSPACE_STORE.list_experiments(),
+            "production": WORKSPACE_STORE.production_experiment(),
+            "running": _EXPERIMENT_ACTIVE.is_set(),
+        }
+
+    @app.post("/quality/api/benchmarks", include_in_schema=False)
+    async def import_quality_benchmark(request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+            benchmark = WORKSPACE_STORE.save_benchmark(
+                str(payload.get("name") or ""),
+                str(payload.get("content") or ""),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return benchmark
+
+    @app.post("/quality/api/experiments", include_in_schema=False)
+    async def create_quality_experiment(request: Request) -> dict[str, Any]:
+        try:
+            return start_quality_experiment(dict(await request.json()))
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post(
+        "/quality/api/experiments/{experiment_id}/production",
+        include_in_schema=False,
+    )
+    def activate_quality_experiment(experiment_id: int) -> dict[str, Any]:
+        try:
+            return WORKSPACE_STORE.set_production_experiment(experiment_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Experiment not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get(
         "/quality",
         response_class=Response,
         include_in_schema=False,
@@ -4170,22 +5411,45 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         )
 
     @app.get("/quality/api/state", include_in_schema=False)
-    def reference_quality_state() -> dict[str, Any]:
+    def reference_quality_state(
+        reranker_choice: str = RERANKER_CHOICE,
+    ) -> dict[str, Any]:
+        try:
+            choice = resolve_reranker_choice(reranker_choice)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        configuration = reranker_configuration(choice)
+        fingerprint = reranker_fingerprint(choice)
         return {
             "summary": WORKSPACE_STORE.quality_summary(
                 min_positive=QUALITY_MIN_POSITIVE_LABELS,
                 min_negative=QUALITY_MIN_NEGATIVE_LABELS,
-                reranker_model=RERANKER_MODEL,
-                reranker_fingerprint=reranker_fingerprint(),
+                reranker_model=str(configuration["model"]),
+                reranker_fingerprint=fingerprint,
             ),
-            "feedback": WORKSPACE_STORE.list_feedback(limit=300),
+            "feedback": WORKSPACE_STORE.list_feedback(
+                limit=300,
+                reranker_fingerprint=fingerprint,
+            ),
+            "reranker": {
+                "choice": choice,
+                "label": str(configuration["label"]),
+                "model": str(configuration["model"]),
+            },
         }
 
     @app.post("/quality/api/feedback", include_in_schema=False)
     async def save_retrieval_feedback(request: Request) -> dict[str, Any]:
         payload = dict(await request.json())
-        payload["reranker_model"] = RERANKER_MODEL
-        payload["reranker_fingerprint"] = reranker_fingerprint()
+        try:
+            feedback_choice = resolve_reranker_choice(
+                str(payload.get("reranker_choice") or RERANKER_CHOICE)
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        feedback_configuration = reranker_configuration(feedback_choice)
+        payload["reranker_model"] = str(feedback_configuration["model"])
+        payload["reranker_fingerprint"] = reranker_fingerprint(feedback_choice)
         try:
             feedback = WORKSPACE_STORE.upsert_feedback(
                 payload,
@@ -4200,8 +5464,8 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
             "calibration": WORKSPACE_STORE.calibration_status(
                 min_positive=QUALITY_MIN_POSITIVE_LABELS,
                 min_negative=QUALITY_MIN_NEGATIVE_LABELS,
-                reranker_model=RERANKER_MODEL,
-                reranker_fingerprint=reranker_fingerprint(),
+                reranker_model=str(feedback_configuration["model"]),
+                reranker_fingerprint=reranker_fingerprint(feedback_choice),
             ),
         }
 
@@ -4218,13 +5482,20 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         return {"deleted": True}
 
     @app.post("/quality/api/calibrate", include_in_schema=False)
-    def recalibrate_reference_quality() -> dict[str, Any]:
+    def recalibrate_reference_quality(
+        reranker_choice: str = RERANKER_CHOICE,
+    ) -> dict[str, Any]:
+        try:
+            choice = resolve_reranker_choice(reranker_choice)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        configuration = reranker_configuration(choice)
         return WORKSPACE_STORE.calibrate_feedback(
             min_positive=QUALITY_MIN_POSITIVE_LABELS,
             min_negative=QUALITY_MIN_NEGATIVE_LABELS,
             min_recall=QUALITY_MIN_RECALL,
-            reranker_model=RERANKER_MODEL,
-            reranker_fingerprint=reranker_fingerprint(),
+            reranker_model=str(configuration["model"]),
+            reranker_fingerprint=reranker_fingerprint(choice),
         )
 
     @app.patch("/quality/api/calibration", include_in_schema=False)
@@ -4234,22 +5505,35 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
         payload = await request.json()
         if "enabled" not in payload:
             raise HTTPException(status_code=400, detail="enabled is required")
+        try:
+            choice = resolve_reranker_choice(
+                str(payload.get("reranker_choice") or RERANKER_CHOICE)
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        configuration = reranker_configuration(choice)
         WORKSPACE_STORE.set_calibration_enabled(
             bool(payload["enabled"]),
-            reranker_model=RERANKER_MODEL,
-            reranker_fingerprint=reranker_fingerprint(),
+            reranker_model=str(configuration["model"]),
+            reranker_fingerprint=reranker_fingerprint(choice),
         )
         return WORKSPACE_STORE.calibration_status(
             min_positive=QUALITY_MIN_POSITIVE_LABELS,
             min_negative=QUALITY_MIN_NEGATIVE_LABELS,
-            reranker_model=RERANKER_MODEL,
-            reranker_fingerprint=reranker_fingerprint(),
+            reranker_model=str(configuration["model"]),
+            reranker_fingerprint=reranker_fingerprint(choice),
         )
 
     @app.get("/quality/export/benchmark", include_in_schema=False)
-    def export_feedback_benchmark() -> Response:
+    def export_feedback_benchmark(
+        reranker_choice: str = RERANKER_CHOICE,
+    ) -> Response:
+        try:
+            choice = resolve_reranker_choice(reranker_choice)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         return Response(
-            WORKSPACE_STORE.benchmark_jsonl(),
+            WORKSPACE_STORE.benchmark_jsonl(reranker_fingerprint(choice)),
             media_type="application/x-ndjson; charset=utf-8",
             headers={
                 "Content-Disposition": 'attachment; filename="reference-quality.jsonl"'

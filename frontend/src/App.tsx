@@ -7,6 +7,7 @@ import {
 import { Toaster } from "sonner"
 import { AppShell } from "@/components/app-shell"
 import { DocumentsPage } from "@/pages/documents-page"
+import { ExperimentsPage } from "@/pages/experiments-page"
 import { QualityPage } from "@/pages/quality-page"
 import { SearchPage } from "@/pages/search-page"
 import { WorkspacePage } from "@/pages/workspace-page"
@@ -30,6 +31,8 @@ export default function App() {
       ? <DocumentsPage />
       : path === "/workspace"
         ? <WorkspacePage />
+        : path === "/experiments"
+          ? <ExperimentsPage />
         : path === "/quality"
           ? <QualityPage />
           : <SearchPage />

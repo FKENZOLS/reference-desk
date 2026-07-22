@@ -8,6 +8,7 @@ from workspace_store import WorkspaceStore
 
 
 def test_react_search_api_returns_structured_citations(tmp_path, monkeypatch) -> None:
+    gte_fingerprint = search_app.reranker_fingerprint("gte")
     result = Candidate(
         document=Document(
             page_content="The station dwell time shall be 30 seconds.",
@@ -28,12 +29,16 @@ def test_react_search_api_returns_structured_citations(tmp_path, monkeypatch) ->
         rerank_rank=1,
         final_score=0.91,
         final_rank=1,
+        reranker_choice="gte",
+        reranker_model="Alibaba-NLP/gte-multilingual-reranker-base",
+        reranker_fingerprint=gte_fingerprint,
     )
     monkeypatch.setattr(search_app, "WORKSPACE_STORE", WorkspaceStore(tmp_path / "workspace.sqlite3"))
-    monkeypatch.setattr(
-        search_app,
-        "search_with_additional",
-        lambda *args, **kwargs: (
+    captured = {}
+
+    def fake_search(*args, **kwargs):
+        captured.update(kwargs)
+        return (
             "",
             "",
             [result],
@@ -46,12 +51,19 @@ def test_react_search_api_returns_structured_citations(tmp_path, monkeypatch) ->
                 "reranker_truncation_rate": 0.0,
                 "best_rerank_logit": 3.5,
                 "considered_count": 1,
+                "reranker_choice": "gte",
+                "reranker_model": "Alibaba-NLP/gte-multilingual-reranker-base",
+                "reranker_fingerprint": gte_fingerprint,
             },
-        ),
-    )
+        )
+
+    monkeypatch.setattr(search_app, "search_with_additional", fake_search)
 
     client = TestClient(search_app.create_web_app(gr.Blocks()))
-    response = client.post("/api/search", json={"query": "station dwell time"})
+    response = client.post(
+        "/api/search",
+        json={"query": "station dwell time", "reranker_choice": "gte"},
+    )
 
     assert response.status_code == 200
     payload = response.json()
@@ -60,4 +72,27 @@ def test_react_search_api_returns_structured_citations(tmp_path, monkeypatch) ->
         "/viewer/standards/manual.pdf?page=51"
     )
     assert payload["results"][0]["feedback"]["query"] == "station dwell time"
+    assert payload["results"][0]["feedback"]["reranker_choice"] == "gte"
+    assert payload["reranker"]["choice"] == "gte"
+    assert captured["reranker_choice"] == "gte"
     assert payload["result_ids"] == ["chunk-1"]
+
+
+def test_reranker_options_and_invalid_choice() -> None:
+    client = TestClient(search_app.create_web_app(gr.Blocks()))
+
+    options = client.get("/api/rerankers")
+    assert options.status_code == 200
+    assert options.json()["status"]["status"] in {
+        "idle", "loading", "ready", "failed", "restart_required"
+    }
+    assert {item["value"] for item in options.json()["options"]} == {
+        "bge",
+        "gte",
+    }
+
+    invalid = client.post(
+        "/api/search",
+        json={"query": "station dwell time", "reranker_choice": "unknown"},
+    )
+    assert invalid.status_code == 400

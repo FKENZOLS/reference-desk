@@ -27,6 +27,7 @@ import time
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from secrets import token_urlsafe
@@ -148,7 +149,8 @@ EXPORT_DEBUG_FILES = True
 INDEX_COMMIT_WAIT_SECONDS = 120
 
 # Increment whenever chunking, prompts, or metadata change materially.
-INGESTION_VERSION = "docling-hybrid-parent-child-v6-qwen"
+INGESTION_VERSION = "docling-hybrid-structural-v7-qwen"
+MANIFEST_SCHEMA_VERSION = 2
 
 
 # ============================================================
@@ -303,7 +305,7 @@ def ids_fingerprint(ids: Sequence[str]) -> str:
 
 def load_manifest() -> dict[str, Any]:
     if not MANIFEST_PATH.exists():
-        return {"version": 1, "sources": {}}
+        return {"version": MANIFEST_SCHEMA_VERSION, "sources": {}, "migration_history": []}
 
     try:
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -314,6 +316,23 @@ def load_manifest() -> dict[str, Any]:
 
     if not isinstance(manifest.get("sources"), dict):
         raise RuntimeError(f"Invalid ingestion manifest: {MANIFEST_PATH}")
+    previous_version = int(manifest.get("version") or 1)
+    if previous_version < MANIFEST_SCHEMA_VERSION:
+        backup = MANIFEST_PATH.with_name(
+            f"{MANIFEST_PATH.name}.pre-v{MANIFEST_SCHEMA_VERSION}-migration.bak"
+        )
+        if not backup.exists():
+            shutil.copy2(MANIFEST_PATH, backup)
+        manifest["version"] = MANIFEST_SCHEMA_VERSION
+        manifest["migration_history"] = [
+            *list(manifest.get("migration_history") or []),
+            {
+                "from": previous_version,
+                "to": MANIFEST_SCHEMA_VERSION,
+                "applied_at": datetime.now(tz=UTC).isoformat(),
+            },
+        ][-20:]
+        save_manifest(manifest)
     return manifest
 
 
@@ -877,6 +896,80 @@ def split_text_for_retrieval(
     return children
 
 
+STRUCTURAL_REQUIREMENT_PATTERN = re.compile(
+    r"\b(?:shall|must|required|requirement|deve|deverá|obrigatório)\b",
+    flags=re.IGNORECASE,
+)
+STRUCTURAL_LIST_PATTERN = re.compile(r"^\s*(?:[-*•]|\d+[.)]|[a-zA-Z][.)])\s+", re.MULTILINE)
+STRUCTURAL_EQUATION_PATTERN = re.compile(
+    r"(?:\$[^$]+\$|\\(?:frac|sum|int|sqrt)\b|[=≈≤≥∑∫√])"
+)
+
+
+def infer_retrieval_unit_type(record: ChunkRecord) -> str:
+    """Classify a parent into a retrieval unit without an LLM."""
+
+    labels = " ".join(record.labels).casefold()
+    text = record.content
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    pipe_rows = sum(line.count("|") >= 2 for line in lines)
+    if "table" in labels or pipe_rows >= 2:
+        return "table"
+    if "list" in labels or len(STRUCTURAL_LIST_PATTERN.findall(text)) >= 2:
+        return "list"
+    if "formula" in labels or "equation" in labels or STRUCTURAL_EQUATION_PATTERN.search(text):
+        return "equation"
+    if STRUCTURAL_REQUIREMENT_PATTERN.search(text):
+        return "requirement"
+    if re.search(r"(?m)^\s*[^:\n]{2,80}:\s+\S", text):
+        return "definition"
+    return "paragraph"
+
+
+def split_structural_record(
+    record: ChunkRecord,
+    runtime: ChunkingRuntime,
+) -> list[tuple[str, str, str]]:
+    """Return meaning-preserving child text, type, and optional table header."""
+
+    unit_type = infer_retrieval_unit_type(record)
+    if unit_type != "table":
+        return [
+            (child, unit_type, "")
+            for child in split_text_for_retrieval(record.content, runtime)
+        ]
+
+    lines = [line.rstrip() for line in record.content.splitlines() if line.strip()]
+    table_lines = [line for line in lines if line.count("|") >= 2]
+    if len(table_lines) < 2:
+        return [
+            (child, unit_type, "")
+            for child in split_text_for_retrieval(record.content, runtime)
+        ]
+
+    header_lines = [table_lines[0]]
+    if len(table_lines) > 1 and re.fullmatch(r"[\s|:+-]+", table_lines[1]):
+        header_lines.append(table_lines[1])
+    data_rows = table_lines[len(header_lines) :]
+    table_header = clean_text(table_lines[0])[:1000]
+    prefix = [line for line in lines if line not in table_lines]
+    groups: list[str] = []
+    current = [*prefix, *header_lines]
+    for row in data_rows:
+        candidate = "\n".join([*current, row])
+        if (
+            len(current) > len(prefix) + len(header_lines)
+            and runtime.count_tokens(candidate) > RETRIEVAL_CHILD_TOKENS
+        ):
+            groups.append(clean_text("\n".join(current)))
+            current = [*header_lines, row]
+        else:
+            current.append(row)
+    if current:
+        groups.append(clean_text("\n".join(current)))
+    return [(group, unit_type, table_header) for group in groups if group]
+
+
 def infer_document_title(
     records: list[ChunkRecord],
     pdf_path: Path,
@@ -906,7 +999,9 @@ def records_to_langchain(
     model_revision = resolved_embedding_revision()
     current_embedding_fingerprint = embedding_fingerprint()
 
-    child_entries: list[tuple[int, ChunkRecord, str, int, int, str]] = []
+    child_entries: list[
+        tuple[int, ChunkRecord, str, int, int, str, str, str]
+    ] = []
     for parent_index, record in enumerate(records):
         parent_chunk_id = make_chunk_id(
             source_id=source_id,
@@ -915,8 +1010,11 @@ def records_to_langchain(
             text=record.content,
             ingestion_signature=current_ingestion_fingerprint + "|parent",
         )
-        children = split_text_for_retrieval(record.content, runtime)
-        for child_index, child_text in enumerate(children, start=1):
+        children = split_structural_record(record, runtime)
+        for child_index, (child_text, unit_type, table_header) in enumerate(
+            children,
+            start=1,
+        ):
             child_entries.append(
                 (
                     parent_index,
@@ -925,6 +1023,8 @@ def records_to_langchain(
                     child_index,
                     len(children),
                     child_text,
+                    unit_type,
+                    table_header,
                 )
             )
 
@@ -936,6 +1036,8 @@ def records_to_langchain(
             child_index,
             child_count,
             child_text,
+            unit_type,
+            table_header,
         ) = entry
         page_start, page_end = get_page_range(record.locations)
         section_path = " > ".join(record.headings)
@@ -969,7 +1071,11 @@ def records_to_langchain(
             "page_end": page_end,
             "section_path": section_path,
             "section_title": record.headings[-1] if record.headings else "",
+            "section_ancestors_json": record.headings,
+            "hierarchy_depth": len(record.headings),
             "content_labels": ", ".join(record.labels),
+            "retrieval_unit_type": unit_type,
+            "table_header": table_header,
             "character_count": len(child_text),
             "word_count": len(child_text.split()),
             "token_count": runtime.count_tokens(child_text),
@@ -981,7 +1087,7 @@ def records_to_langchain(
             ).hexdigest(),
             "parser": "docling",
             "ocr_applied": record.ocr_applied,
-            "chunker": "hybrid-parent-child",
+            "chunker": "hybrid-structural-parent-child",
             "tokenizer": tokenizer_name,
             "embedding_model": EMBEDDING_MODEL,
             "embedding_model_revision": model_revision,

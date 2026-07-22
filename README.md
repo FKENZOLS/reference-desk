@@ -25,6 +25,10 @@ uploaded to GitHub.
 - Compare passages and export selected material to Markdown or Word.
 - Add, replace, quarantine, restore, and back up documents from the interface.
 - Check corpus health, storage use, duplicates, and document revisions.
+- Compare retrieval configurations in a saved evaluation workbench.
+- Recover from CUDA reranker failures without restarting the whole app.
+- Explain why each result was shown or hidden and collect richer quality labels.
+- Export a privacy-safe diagnostic ZIP without PDFs, queries, or excerpts.
 
 ## Computer requirements
 
@@ -64,8 +68,8 @@ from inside the ZIP.
 
 The setup detects NVIDIA CUDA, AMD ROCm, or CPU mode, creates an isolated
 Python environment, installs the correct packages, downloads Qwen3-Embedding
-through Ollama, caches the public Qwen tokenizer and reranker from Hugging
-Face, and checks the computer. The first installation is several gigabytes and
+through Ollama, caches the public tokenizer and selectable rerankers from
+Hugging Face, and checks the computer. The first installation is several gigabytes and
 can take a while.
 
 The window stays open if anything goes wrong, so the error message can be
@@ -108,9 +112,53 @@ If automatic detection selects the wrong backend, replace `auto` with `rocm`,
 4. Wait for indexing to finish.
 5. Return to **Search** and search the whole collection.
 
+Open **Filters and search within results** to switch between the BGE and
+multilingual GTE rerankers. GTE is loaded and validated by default in an
+isolated GPU worker. The first
+search after switching can take longer
+while the selected model loads. Reference Desk keeps only one reranker loaded
+at a time to avoid multiplying GPU memory use. If CUDA inference crashes, the
+worker restarts while the web application and your open pages stay available.
+The search page reports model loading, worker identity, and device health.
+Enable **Show
+retrieval diagnostics** to inspect dense, lexical, fusion, reranker, token,
+truncation, timing, and adaptive candidate-allocation data for each result.
+Expand **Why this result** to see which retrieval lanes found the passage, its
+fusion and reranker positions, and why it survived relevance and diversity
+filters. The results header summarizes why other candidates were hidden.
+
+Select several result checkboxes to label them together. Quality feedback can
+also name an expected document page when the correct passage is missing, add
+an optional reason, undo a label, or mark a question as ambiguous. Ambiguous
+queries are excluded from benchmarks; incorrect displayed passages become
+hard negatives.
+
+Open **Experiments** to import a JSONL benchmark or use complete cases built
+from relevance feedback. You can compare GTE and BGE on the same candidate
+pool, vary candidate count, reranker weight, and passage mode, then save the
+results. Selecting **Use in production** applies that completed experiment's
+reranker, candidate count, blend weight, and passage mode to normal searches.
+Two-model comparison runs are intentionally not promotable; run the winning
+model once by itself to create an unambiguous production configuration.
+Imported benchmarks support calibration/test splits, categories, languages,
+multiple acceptable passages, and hard negatives. Results include 95%
+confidence intervals and subgroup metrics. A saved baseline can block
+promotion when nDCG@5 falls by more than the configured regression threshold.
+Baselines must contain every selected reranker and the exact same benchmark
+version and split.
+
 Large or scanned documents can take longer. The ingestion queue can be paused
 between documents, and a failed PDF is moved to quarantine instead of stopping
-the rest of the queue.
+the rest of the queue. Each PDF now has one explicit lifecycle—uploaded,
+pending, processing, indexed, failed, or quarantined—with its indexed hash and
+transition history visible from the Documents table.
+
+The bell in the lower-right corner keeps persistent updates for model loading,
+indexing, worker restarts, backups, and experiments. **Export diagnostics** on
+the Documents page creates a support ZIP containing only sanitized settings,
+package/GPU information, aggregate corpus health, migration state, and generic
+errors. It excludes document names and paths, PDFs, excerpts, queries, and
+feedback text.
 
 ## Update to the latest version
 
@@ -118,6 +166,12 @@ If you installed the ZIP, download it again, extract it over the existing
 `reference-desk` folder, and allow Windows to replace files with matching
 names. The package contains no PDFs or research databases, so your local data
 is left in place. Run `SETUP.bat` again after a major update.
+
+This release changes retrieval chunks to preserve table column headers,
+section ancestry, and paragraph/list/definition/requirement/equation types.
+After upgrading, open **Documents** and choose **Reindex all** once so existing
+PDFs receive the new structural metadata. Local state migrations create a
+small `pre-v*-migration.bak` snapshot before changing an older schema.
 
 If you installed with Git, open PowerShell in the `reference-desk` folder and
 run:
@@ -247,7 +301,7 @@ flowchart LR
         F --> H
         G --> I["Reciprocal-rank fusion"]
         H --> I
-        I --> J["Qwen3-Reranker 0.6B<br/>yes/no score for 20 candidates"]
+        I --> J["BGE or multilingual GTE<br/>cross-encoder score for 20 candidates"]
         J --> K["Diversity and evidence gate<br/>normally show 5 results"]
     end
 
@@ -292,15 +346,13 @@ A passage found by both lanes rises naturally, while a strong result from only
 one lane can still survive. By default, each lane retrieves 40 candidates and
 the fused list keeps 20 for reranking.
 
-### Qwen reranking and result diversity
+### Cross-encoder reranking and result diversity
 
-`Qwen/Qwen3-Reranker-0.6B` reads the technical-reference instruction, query,
-and each shortlisted passage together. Its causal language model scores the
-next-token alternatives `yes` and `no`; Reference Desk stores their log-odds
-difference and the corresponding probability. This joint judgment is more
-expensive than vector similarity, so it runs only after hybrid retrieval has
-reduced the corpus to 20 candidates. The former BGE classifier remains
-available through environment settings for controlled comparisons.
+The selectable BGE and multilingual GTE rerankers read the query and each
+shortlisted passage together and produce a relevance logit and probability.
+This joint judgment is more expensive than vector similarity, so it runs only
+after hybrid retrieval has reduced the corpus to 20 candidates. GTE is the
+smaller option and uses its official custom Transformers implementation.
 
 The final selector normally shows five results. It limits repeated passages
 from the same page or section, then optionally applies a relevance threshold
@@ -308,8 +360,9 @@ learned from explicit user labels. The threshold remains inactive until there
 are enough relevant and incorrect examples to calibrate it safely.
 
 Reranker calibration is keyed to the complete model and prompt fingerprint.
-Changing between Qwen and BGE therefore starts a separate score calibration;
-old thresholds cannot silently affect the new model.
+Changing between BGE and GTE therefore starts a separate score calibration;
+old thresholds and judgments cannot silently affect the new model. Select the
+model on the **Reference quality** page to inspect or calibrate it independently.
 
 ### Model migration and index identity
 
@@ -340,6 +393,17 @@ makes rollback possible but may temporarily use additional disk space.
 The benchmark format stores expected source pages and passages. User feedback
 can be exported into the same format, allowing changes to chunking, candidate
 counts, fusion, or reranking to be compared against real reference tasks.
+`relevant_targets` groups alternative identifiers such as a chunk ID and its
+source page into one acceptable passage, so reindexing does not count the same
+answer twice.
+
+GTE requires the model publisher's custom Python architecture. Release defaults
+pin the GTE weights, that remote-code repository, and BGE weights to reviewed
+immutable Hugging Face commits. Operators may deliberately test other commits
+with model-specific variables such as `RAG_GTE_RERANKER_REVISION` and
+`RAG_GTE_RERANKER_CODE_REVISION`; do not set either variable to a moving branch
+such as `main` on production machines. The legacy unsuffixed variables apply
+only to the startup-selected reranker.
 
 <details>
 <summary>Developer commands</summary>
@@ -348,10 +412,24 @@ counts, fusion, or reranking to be compared against real reference tasks.
 python main.py serve
 python main.py ingest
 python main.py evaluate examples/benchmark.example.jsonl
+python main.py evaluate examples/benchmark.example.jsonl --reranker both
+python main.py evaluate examples/benchmark.example.jsonl --reranker gte --candidate-count 40 --rerank-weight 0.75
+python main.py evaluate examples/benchmark.example.jsonl --reranker gte --passage-mode metadata-child-parent
 python main.py doctor
 python main.py export
 python main.py test
+cd frontend
+npm run typecheck
+npm run build
 ```
+
+`--reranker both` retrieves each benchmark query once and applies BGE and GTE
+to cloned identical candidate pools. Evaluation reports fusion recall at 10,
+20, 40, and 80 in addition to selected recall, MRR, nDCG, truncation, and
+latency. Use a representative held-out benchmark before changing production
+candidate counts or blend weights. `--passage-mode` compares child text,
+metadata plus child text, parent context, or combined child and parent context
+without changing the production input format.
 
 The production React bundle is included in `frontend/dist`. Node.js 20 or newer
 is needed only when modifying `frontend/src`. Read

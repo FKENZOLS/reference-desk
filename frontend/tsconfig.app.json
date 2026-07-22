@@ -16,7 +16,15 @@
     "noEmit": true,
     "jsx": "react-jsx",
     "baseUrl": ".",
-    "paths": { "@/*": ["./src/*"] }
+    "paths": {
+      "@/*": ["./src/*"],
+      "@radix-ui/react-slot": ["./src/shims/slot.tsx"],
+      "class-variance-authority": ["./src/shims/cva.ts"],
+      "clsx": ["./src/shims/clsx.ts"],
+      "lucide-react": ["./src/shims/lucide-react.tsx"],
+      "sonner": ["./src/shims/sonner.tsx"],
+      "tailwind-merge": ["./src/shims/tailwind-merge.ts"]
+    }
   },
   "include": ["src"]
 }

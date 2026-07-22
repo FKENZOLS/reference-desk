@@ -1,11 +1,12 @@
 {
   "name": "reference-desk-ui",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
     "build": "vite build"
   },
   "dependencies": {
@@ -13,7 +14,11 @@
     "react-dom": "19.2.6"
   },
   "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "6.0.2",
-    "vite": "8.0.13"
+    "typescript": "5.9.3",
+    "vite": "8.1.5"
   }
 }

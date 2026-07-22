@@ -4,15 +4,15 @@ Shared storage and embedding settings remain in ``rag_common``. This module
 owns only search, reranking, and web-server configuration so that
 ``search_app`` can focus on application behavior.
 
-BGE is the default reranker.
+GTE is the default reranker.
 
 Select BGE explicitly with:
 
     RAG_RERANKER_CHOICE=bge
 
-Select Qwen with:
+Select GTE with:
 
-    RAG_RERANKER_CHOICE=qwen
+    RAG_RERANKER_CHOICE=gte
 
 The selected preset controls the reranker model and backend. This prevents old
 ``RAG_RERANKER_MODEL`` or ``RAG_RERANKER_BACKEND`` environment variables from
@@ -133,7 +133,12 @@ RERANK_WEIGHT = env_float(
 
 RERANKER_PRESETS: dict[str, dict[str, Any]] = {
     "bge": {
+        "label": "BGE",
+        "description": "Fast multilingual cross-encoder reranking.",
         "model": "BAAI/bge-reranker-v2-m3",
+        # Immutable Hugging Face revisions keep releases reproducible and stop
+        # an upstream branch update from changing executable model code.
+        "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
         "backend": "classifier",
         "prompt_version": "bge-reranker-reference-v1",
         "instruction": (
@@ -144,21 +149,28 @@ RERANKER_PRESETS: dict[str, dict[str, Any]] = {
         "max_length": 512,
         "batch_size": 8,
         "use_fp16": True,
+        "trust_remote_code": False,
     },
-    "qwen": {
-        "model": "Qwen/Qwen3-Reranker-0.6B",
-        "backend": "qwen-causal-lm",
-        "prompt_version": "qwen3-reranker-reference-v1",
+    "gte": {
+        "label": "GTE",
+        "description": "Compact multilingual cross-encoder for 70+ languages.",
+        "model": "Alibaba-NLP/gte-multilingual-reranker-base",
+        "revision": "8215cf04918ba6f7b6a62bb44238ce2953d8831c",
+        "code_repository": "Alibaba-NLP/new-impl",
+        "code_revision": "40ced75c3017eb27626c9d4ea981bde21a2662f4",
+        "backend": "classifier",
+        "prompt_version": "gte-multilingual-reranker-base-v1",
         "instruction": (
-            "Given a technical-document search query, determine whether the "
-            "document passage directly defines, specifies, explains, or "
-            "constrains the requested subject. Prefer exact, citable reference "
-            "evidence."
+            "Determine whether the multilingual document passage is relevant "
+            "to the search query. Prefer exact and citable evidence."
         ),
-        # Smaller batch because Qwen's causal-LM scoring uses more memory.
+        # Parent passages are normally below this limit; keeping the bounded
+        # input avoids paying the model's full 8192-token context cost.
         "max_length": 512,
-        "batch_size": 4,
+        "batch_size": 8,
         "use_fp16": True,
+        # The official model config maps to Alibaba-NLP/new-impl.
+        "trust_remote_code": True,
     },
 }
 
@@ -174,10 +186,10 @@ def resolve_reranker_choice(configured: str) -> str:
         "bge-v2-m3": "bge",
         "bge-reranker": "bge",
         "bge-reranker-v2-m3": "bge",
-        "qwen": "qwen",
-        "qwen3": "qwen",
-        "qwen-reranker": "qwen",
-        "qwen3-reranker": "qwen",
+        "gte": "gte",
+        "gte-multilingual": "gte",
+        "gte-reranker": "gte",
+        "gte-multilingual-reranker-base": "gte",
     }
 
     try:
@@ -192,11 +204,11 @@ def resolve_reranker_choice(configured: str) -> str:
         ) from error
 
 
-# BGE is the default when RAG_RERANKER_CHOICE is not set.
+# GTE is the default when RAG_RERANKER_CHOICE is not set.
 RERANKER_CHOICE = resolve_reranker_choice(
     os.environ.get(
         "RAG_RERANKER_CHOICE",
-        "bge",
+        "gte",
     )
 )
 
@@ -220,7 +232,12 @@ RERANKER_BACKEND = str(
 
 RERANKER_REVISION = os.environ.get(
     "RAG_RERANKER_REVISION",
-    "main",
+    str(RERANKER_PRESET["revision"]),
+)
+
+RERANKER_CODE_REVISION = os.environ.get(
+    "RAG_RERANKER_CODE_REVISION",
+    str(RERANKER_PRESET.get("code_revision") or RERANKER_PRESET["revision"]),
 )
 
 RERANKER_USE_AUTH = env_flag(
@@ -285,21 +302,12 @@ def resolve_reranker_backend(
 ) -> str:
     """Resolve and validate the reranker backend.
 
-    Supported backends:
-
-    ``qwen-causal-lm``
-        Qwen3-Reranker's generative yes/no scoring implementation.
-
-    ``classifier``
-        Sequence-classifier or cross-encoder implementation used by BGE.
+    The selectable rerankers use sequence-classification cross-encoders.
     """
 
     value = configured.strip().lower().replace("_", "-")
 
     aliases = {
-        "qwen": "qwen-causal-lm",
-        "qwen-causal": "qwen-causal-lm",
-        "qwen-causal-lm": "qwen-causal-lm",
         "classifier": "classifier",
         "cross-encoder": "classifier",
         "crossencoder": "classifier",
@@ -310,51 +318,76 @@ def resolve_reranker_backend(
         resolved = aliases[value]
     except KeyError as error:
         raise ValueError(
-            "Reranker backend must be qwen-causal-lm or classifier. "
+            "Reranker backend must be classifier. "
             f"Received: {configured!r}."
         ) from error
-
-    normalized_model = model_name.lower()
-
-    if resolved == "qwen-causal-lm":
-        if "qwen3-reranker" not in normalized_model:
-            raise ValueError(
-                "The qwen-causal-lm backend requires a Qwen3-Reranker model. "
-                f"Configured model: {model_name!r}."
-            )
-
-    if resolved == "classifier":
-        if "qwen3-reranker" in normalized_model:
-            raise ValueError(
-                "Qwen3-Reranker cannot use the classifier backend. "
-                "Choose RAG_RERANKER_CHOICE=qwen instead."
-            )
 
     return resolved
 
 
-def reranker_configuration() -> dict[str, object]:
-    """Return the active reranker configuration."""
+def reranker_configuration(choice: str | None = None) -> dict[str, object]:
+    """Return one preset's effective reranker configuration.
+
+    Environment overrides apply to every selectable preset, while each preset
+    keeps its own model, backend, and safe batch-size defaults.
+    """
+
+    selected = RERANKER_CHOICE if choice is None else resolve_reranker_choice(choice)
+    preset = RERANKER_PRESETS[selected]
+    revision = os.environ.get(f"RAG_{selected.upper()}_RERANKER_REVISION")
+    code_revision = os.environ.get(
+        f"RAG_{selected.upper()}_RERANKER_CODE_REVISION"
+    )
+    if selected == RERANKER_CHOICE:
+        revision = revision or RERANKER_REVISION
+        code_revision = code_revision or RERANKER_CODE_REVISION
 
     return {
-        "choice": RERANKER_CHOICE,
-        "model": RERANKER_MODEL,
-        "revision": RERANKER_REVISION,
-        "backend": resolve_reranker_backend(),
+        "choice": selected,
+        "label": str(preset["label"]),
+        "description": str(preset["description"]),
+        "model": str(preset["model"]),
+        "revision": revision or str(preset["revision"]),
+        "code_repository": str(preset.get("code_repository") or ""),
+        "code_revision": code_revision
+        or str(preset.get("code_revision") or preset["revision"]),
+        "backend": resolve_reranker_backend(
+            str(preset["model"]),
+            str(preset["backend"]),
+        ),
         "use_auth": RERANKER_USE_AUTH,
-        "max_length": RERANK_MAX_LENGTH,
-        "batch_size": RERANK_BATCH_SIZE,
-        "use_fp16": RERANK_USE_FP16,
-        "prompt_version": RERANKER_PROMPT_VERSION,
-        "instruction": RERANK_INSTRUCTION,
+        "trust_remote_code": bool(preset.get("trust_remote_code", False)),
+        "max_length": env_int(
+            "RAG_RERANK_MAX_LENGTH",
+            int(preset["max_length"]),
+        ),
+        "batch_size": env_int(
+            "RAG_RERANK_BATCH_SIZE",
+            int(preset["batch_size"]),
+        ),
+        "use_fp16": env_flag(
+            "RAG_RERANK_FP16",
+            bool(preset["use_fp16"]),
+        ),
+        "prompt_version": os.environ.get(
+            "RAG_RERANKER_PROMPT_VERSION",
+            str(preset["prompt_version"]),
+        ),
+        "instruction": os.environ.get(
+            "RAG_RERANK_INSTRUCTION",
+            str(preset["instruction"]),
+        ),
     }
 
 
-def reranker_fingerprint() -> str:
+def reranker_fingerprint(choice: str | None = None) -> str:
     """Produce a stable hash for reranker-dependent stored data."""
 
+    configuration = reranker_configuration(choice)
+    configuration.pop("label", None)
+    configuration.pop("description", None)
     payload = json.dumps(
-        reranker_configuration(),
+        configuration,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -364,10 +397,10 @@ def reranker_fingerprint() -> str:
     ).hexdigest()
 
 
-def reranker_summary() -> str:
+def reranker_summary(choice: str | None = None) -> str:
     """Return a readable description of the active reranker."""
 
-    configuration = reranker_configuration()
+    configuration = reranker_configuration(choice)
 
     return (
         f"{configuration['choice']} | "

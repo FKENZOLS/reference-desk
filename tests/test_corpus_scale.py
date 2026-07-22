@@ -54,6 +54,25 @@ def test_queue_is_persistent_and_pauses_between_documents(tmp_path: Path) -> Non
     assert restarted.queued_sources() == ["two.pdf"]
 
 
+def test_queue_reconciles_document_that_is_already_indexed(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(pdf(tmp_path, "manual.part"), "manual.pdf")
+    corpus = manager(tmp_path, repo)
+    corpus.prepare_queue(repo.summary(), force=False)
+    repo.clear_pending_sources(("manual.pdf",), ())
+    summary = {
+        "pending_sources": [],
+        "documents": [{"source_id": "manual.pdf", "status": "indexed"}],
+    }
+
+    reconciled = corpus.reconcile_indexed_documents(summary)
+    snapshot = corpus.snapshot()
+
+    assert reconciled == ["manual.pdf"]
+    assert snapshot["remaining"] == 0
+    assert snapshot["counts"] == {"complete": 1}
+
+
 def test_duplicate_detection_revision_history_and_rollback(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     original = pdf(tmp_path, "original.part")
@@ -139,4 +158,3 @@ def test_backup_and_restore_replace_the_full_corpus_snapshot(tmp_path: Path) -> 
     assert index_file.read_bytes() == b"original-index"
     with sqlite3.connect(workspace) as connection:
         assert connection.execute("SELECT value FROM notes").fetchone()[0] == "original-note"
-

@@ -9,11 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 import search_app
+from app_settings import reranker_configuration, reranker_fingerprint, resolve_reranker_choice
 from search_app import (
     Candidate,
     RetrievalFilters,
     additional_button_label,
     bbox_to_percentages,
+    build_rerank_passage,
     first_existing,
     gradio_search,
     normalize_source_filter,
@@ -24,13 +26,216 @@ from search_app import (
     resolve_torch_device,
     select_results,
     select_additional_results,
+    select_runtime_reranker,
     source_citation,
     source_viewer_html,
     source_url,
     text_lines_from_pdfium_page,
     toggle_additional_sources,
     document_matches_filters,
+    analyze_query,
 )
+from reranker_worker import RerankerWorkerClient, RerankerWorkerError
+
+
+def test_runtime_reranker_switches_only_when_choice_changes(monkeypatch) -> None:
+    created = []
+
+    class FakeSelectableReranker:
+        def __init__(self, choice):
+            self.choice = choice
+            self.model_name = choice
+            self.fingerprint = f"fingerprint-{choice}"
+            self.model = object()
+            self.tokenizer = object()
+            created.append(choice)
+
+    current = FakeSelectableReranker("bge")
+    runtime = SimpleNamespace(reranker=current, reranker_choice="bge")
+    monkeypatch.setattr(search_app, "LocalReranker", FakeSelectableReranker)
+    monkeypatch.setattr(search_app.gc, "collect", lambda: None)
+
+    assert select_runtime_reranker(runtime, "bge") is current
+    switched = select_runtime_reranker(runtime, "gte")
+
+    assert switched.choice == "gte"
+    assert runtime.reranker_choice == "gte"
+    assert created == ["bge", "gte"]
+
+
+def test_gte_reranker_preset_uses_the_official_custom_classifier() -> None:
+    configuration = reranker_configuration("gte-multilingual-reranker-base")
+
+    assert resolve_reranker_choice("gte-reranker") == "gte"
+    assert configuration["model"] == "Alibaba-NLP/gte-multilingual-reranker-base"
+    assert configuration["backend"] == "classifier"
+    assert configuration["trust_remote_code"] is True
+    assert configuration["revision"] == "8215cf04918ba6f7b6a62bb44238ce2953d8831c"
+    assert configuration["code_repository"] == "Alibaba-NLP/new-impl"
+    assert configuration["code_revision"] == "40ced75c3017eb27626c9d4ea981bde21a2662f4"
+    assert reranker_configuration("bge")["revision"] == (
+        "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+    )
+    assert reranker_fingerprint("gte") != reranker_fingerprint("bge")
+
+
+def test_query_analysis_adapts_dense_lexical_and_within_result_work() -> None:
+    exact = analyze_query('"ISO 9001" section 7.4')
+    natural = analyze_query("How does the braking system detect a failure?")
+    short = analyze_query("braking distance")
+    within = analyze_query("braking distance", within_results=True)
+    technical = analyze_query("CUDA ERROR 719 on 2026-07-21 where x = y")
+    portuguese = analyze_query("Como o sistema detecta uma falha?")
+
+    assert exact.strategy == "lexical-first"
+    assert exact.lexical_candidates > exact.dense_candidates
+    assert natural.strategy == "dense-first"
+    assert natural.dense_candidates > natural.lexical_candidates
+    assert short.strategy == "wide-short-query"
+    assert short.dense_candidates >= search_app.DENSE_CANDIDATES
+    assert within.strategy == "within-results"
+    assert within.rerank_candidates < search_app.RERANK_CANDIDATES
+    assert technical.strategy == "lexical-first"
+    assert {"error code", "date", "mathematical expression"} <= set(
+        technical.signals
+    )
+    assert portuguese.language == "pt"
+
+
+def test_recovered_worker_failure_does_not_require_application_restart() -> None:
+    worker = object.__new__(RerankerWorkerClient)
+    worker.choice = "gte"
+    worker.model_name = "gte"
+    worker.fingerprint = "gte-fingerprint"
+    worker.device = "cuda:0"
+    worker.pid = 123
+    worker.restart_count = 1
+    worker.predict = lambda pairs: (_ for _ in ()).throw(
+        RerankerWorkerError("worker restarted", recovered=True)
+    )
+    runtime = SimpleNamespace(
+        reranker=worker,
+        reranker_choice="gte",
+        inference_lock=threading.Lock(),
+    )
+    item = candidate(0.0)
+    item.retrieval_rank = 1
+
+    with pytest.raises(search_app.RerankerUnavailableError, match="worker restarted"):
+        rerank_candidates(runtime, "question", [item])
+
+    status = search_app.reranker_runtime_status()
+    assert status["restart_required"] is False
+    assert status["worker_restarts"] == 1
+
+
+def test_reranker_passage_modes_support_offline_input_ablations() -> None:
+    document = Document(
+        page_content="precise child passage",
+        metadata={
+            "document_title": "Manual",
+            "source_id": "manual.pdf",
+            "section_path": "Braking",
+            "parent_content": "broader parent context",
+        },
+    )
+
+    assert build_rerank_passage(document, "child") == "precise child passage"
+    assert "Document: Manual" in build_rerank_passage(document, "metadata-child")
+    assert "broader parent context" in build_rerank_passage(
+        document, "metadata-parent"
+    )
+    combined = build_rerank_passage(document, "metadata-child-parent")
+    assert "precise child passage" in combined
+    assert "Parent context:\nbroader parent context" in combined
+
+
+def test_gte_loader_enables_trusted_remote_code(monkeypatch) -> None:
+    calls = {}
+
+    class FakeTokenizer:
+        pad_token_id = 0
+
+    class FakeModel:
+        def to(self, device):
+            calls["device"] = str(device)
+
+        def eval(self):
+            calls["evaluated"] = True
+
+    def fake_tokenizer_loader(model_name, **kwargs):
+        calls["tokenizer"] = (model_name, kwargs)
+        return FakeTokenizer()
+
+    def fake_model_loader(model_name, **kwargs):
+        calls["model"] = (model_name, kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr(search_app, "resolve_torch_device", lambda device: search_app.torch.device("cpu"))
+    monkeypatch.setattr(search_app.AutoTokenizer, "from_pretrained", fake_tokenizer_loader)
+    monkeypatch.setattr(
+        search_app.AutoModelForSequenceClassification,
+        "from_pretrained",
+        fake_model_loader,
+    )
+
+    reranker = search_app.LocalReranker(choice="gte")
+
+    assert reranker.backend == "classifier"
+    assert calls["tokenizer"][1]["trust_remote_code"] is True
+    assert calls["model"][1]["trust_remote_code"] is True
+    assert calls["evaluated"] is True
+
+
+def test_gte_loader_repairs_uninitialized_position_ids(monkeypatch) -> None:
+    class FakeTokenizer:
+        pad_token_id = 0
+
+    class FakeEmbeddings(search_app.torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer(
+                "position_ids",
+                search_app.torch.tensor([0, 918273645, -4, 0]),
+                persistent=False,
+            )
+
+    class FakeBaseModel:
+        def __init__(self):
+            self.embeddings = FakeEmbeddings()
+
+    class FakeConfig:
+        max_position_embeddings = 4
+
+    class FakeModel:
+        def __init__(self):
+            self.new = FakeBaseModel()
+            self.config = FakeConfig()
+
+        def to(self, device):
+            self.new.embeddings.to(device)
+
+        def eval(self):
+            pass
+
+    model = FakeModel()
+    monkeypatch.setattr(
+        search_app, "resolve_torch_device", lambda device: search_app.torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        search_app.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        search_app.AutoModelForSequenceClassification,
+        "from_pretrained",
+        lambda *args, **kwargs: model,
+    )
+
+    search_app.LocalReranker(choice="gte")
+
+    assert model.new.embeddings.position_ids.tolist() == [0, 1, 2, 3]
 
 
 def candidate(score: float) -> Candidate:
@@ -382,6 +587,20 @@ def test_additional_results_exclude_selected_parents_and_keep_new_context() -> N
         [first],
     )
     assert additional == [new_context]
+
+
+def test_additional_results_use_the_active_reranker_gate(monkeypatch) -> None:
+    choices = []
+    item = candidate(1.0)
+    monkeypatch.setattr(
+        search_app,
+        "relevance_gate_thresholds",
+        lambda choice=None: choices.append(choice) or None,
+    )
+
+    select_additional_results([item], [], "gte")
+
+    assert choices == ["gte"]
 
 
 def test_additional_button_label_reflects_toggle_state() -> None:

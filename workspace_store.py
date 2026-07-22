@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import math
 import os
@@ -26,7 +27,11 @@ FEEDBACK_JUDGMENTS = {
     "wrong_passage",
     "wrong_document",
     "no_relevant_result",
+    "expected_passage",
+    "ambiguous",
 }
+
+WORKSPACE_SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -39,7 +44,31 @@ class WorkspaceStore:
     def __init__(self, path: str | Path = DEFAULT_WORKSPACE_DB) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._backup_before_migration()
         self._initialize()
+
+    def _backup_before_migration(self) -> None:
+        """Make one recoverable SQLite snapshot before changing an old schema."""
+
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        source = sqlite3.connect(self.path, timeout=30)
+        try:
+            version = int(source.execute("PRAGMA user_version").fetchone()[0])
+            if version >= WORKSPACE_SCHEMA_VERSION:
+                return
+            backup = self.path.with_name(
+                f"{self.path.name}.pre-v{WORKSPACE_SCHEMA_VERSION}-migration.bak"
+            )
+            if backup.exists():
+                return
+            destination = sqlite3.connect(backup)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+        finally:
+            source.close()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -51,8 +80,19 @@ class WorkspaceStore:
 
     def _initialize(self) -> None:
         with self.connect() as connection:
+            current_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if current_version > WORKSPACE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "This workspace database was created by a newer Reference Desk "
+                    f"schema (v{current_version}); this build supports v"
+                    f"{WORKSPACE_SCHEMA_VERSION}."
+                )
             connection.executescript(
                 """
+                BEGIN IMMEDIATE;
+
                 CREATE TABLE IF NOT EXISTS collections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -100,7 +140,7 @@ class WorkspaceStore:
                     target_key TEXT NOT NULL,
                     judgment TEXT NOT NULL CHECK(judgment IN (
                         'relevant', 'wrong_passage', 'wrong_document',
-                        'no_relevant_result'
+                        'no_relevant_result', 'expected_passage', 'ambiguous'
                     )),
                     chunk_id TEXT NOT NULL DEFAULT '',
                     source_id TEXT NOT NULL DEFAULT '',
@@ -118,11 +158,14 @@ class WorkspaceStore:
                     final_score REAL,
                     reranker_model TEXT NOT NULL DEFAULT '',
                     reranker_fingerprint TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    expected_source_id TEXT NOT NULL DEFAULT '',
+                    expected_page INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(
                         query, source_filter, section_filter, content_filter,
-                        date_filter, target_key
+                        date_filter, target_key, reranker_fingerprint
                     )
                 );
 
@@ -155,6 +198,66 @@ class WorkspaceStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS quality_benchmarks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    content_hash TEXT NOT NULL,
+                    case_count INTEGER NOT NULL,
+                    content_jsonl TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS quality_benchmark_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    benchmark_id INTEGER NOT NULL REFERENCES quality_benchmarks(id)
+                        ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    case_count INTEGER NOT NULL,
+                    content_jsonl TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(benchmark_id, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS quality_experiments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    benchmark_id INTEGER REFERENCES quality_benchmarks(id)
+                        ON DELETE SET NULL,
+                    benchmark_name TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'queued', 'running', 'complete', 'failed'
+                    )),
+                    config_json TEXT NOT NULL,
+                    results_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    production INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL DEFAULT 'system',
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK(status IN (
+                        'info', 'success', 'warning', 'error'
+                    )),
+                    task_key TEXT NOT NULL DEFAULT '',
+                    read_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_bookmarks_collection
                     ON bookmarks(collection_id, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_history_created
@@ -163,6 +266,12 @@ class WorkspaceStore:
                     ON retrieval_feedback(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_feedback_judgment
                     ON retrieval_feedback(judgment, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_experiments_updated
+                    ON quality_experiments(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_benchmark_versions
+                    ON quality_benchmark_versions(benchmark_id, version DESC);
+                CREATE INDEX IF NOT EXISTS idx_notifications_created
+                    ON notifications(created_at DESC);
                 """
             )
             self._ensure_column(
@@ -179,6 +288,30 @@ class WorkspaceStore:
             )
             self._ensure_column(
                 connection,
+                "retrieval_feedback",
+                "reason",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "retrieval_feedback",
+                "expected_source_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "retrieval_feedback",
+                "expected_page",
+                "INTEGER",
+            )
+            self._ensure_column(
+                connection,
+                "quality_benchmarks",
+                "metadata_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            self._ensure_column(
+                connection,
                 "quality_calibration",
                 "reranker_model",
                 "TEXT NOT NULL DEFAULT ''",
@@ -189,6 +322,7 @@ class WorkspaceStore:
                 "reranker_fingerprint",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            self._migrate_feedback_identity(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_feedback_reranker
@@ -208,6 +342,108 @@ class WorkspaceStore:
                 FROM quality_calibration WHERE id = 1
                 """
             )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO quality_benchmark_versions(
+                    benchmark_id, version, content_hash, case_count,
+                    content_jsonl, metadata_json, created_at
+                )
+                SELECT id, version, content_hash, case_count, content_jsonl,
+                       metadata_json, updated_at
+                FROM quality_benchmarks
+                """
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (WORKSPACE_SCHEMA_VERSION, utc_now()),
+            )
+            connection.execute(f"PRAGMA user_version = {WORKSPACE_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_feedback_identity(connection: sqlite3.Connection) -> None:
+        """Keep judgments for different rerankers as independent records."""
+
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("retrieval_feedback",),
+        ).fetchone()
+        table_sql = "".join(str(row["sql"] or "").lower().split()) if row else ""
+        expected_identity = (
+            "unique(query,source_filter,section_filter,content_filter,"
+            "date_filter,target_key,reranker_fingerprint)"
+        )
+        if expected_identity in table_sql and "'expected_passage'" in table_sql:
+            return
+
+        connection.execute(
+            "ALTER TABLE retrieval_feedback RENAME TO retrieval_feedback_legacy"
+        )
+        connection.execute(
+            """
+            CREATE TABLE retrieval_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                judgment TEXT NOT NULL CHECK(judgment IN (
+                    'relevant', 'wrong_passage', 'wrong_document',
+                    'no_relevant_result', 'expected_passage', 'ambiguous'
+                )),
+                chunk_id TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
+                document_title TEXT NOT NULL DEFAULT '',
+                page_start INTEGER,
+                page_end INTEGER,
+                section TEXT NOT NULL DEFAULT '',
+                excerpt TEXT NOT NULL DEFAULT '',
+                source_filter TEXT NOT NULL DEFAULT '',
+                section_filter TEXT NOT NULL DEFAULT '',
+                content_filter TEXT NOT NULL DEFAULT '',
+                date_filter TEXT NOT NULL DEFAULT '',
+                result_rank INTEGER,
+                rerank_logit REAL,
+                final_score REAL,
+                reranker_model TEXT NOT NULL DEFAULT '',
+                reranker_fingerprint TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                expected_source_id TEXT NOT NULL DEFAULT '',
+                expected_page INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(
+                    query, source_filter, section_filter, content_filter,
+                    date_filter, target_key, reranker_fingerprint
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO retrieval_feedback(
+                id, query, target_key, judgment, chunk_id, source_id,
+                document_title, page_start, page_end, section, excerpt,
+                source_filter, section_filter, content_filter, date_filter,
+                result_rank, rerank_logit, final_score, reranker_model,
+                reranker_fingerprint, reason, expected_source_id,
+                expected_page, created_at, updated_at
+            )
+            SELECT
+                id, query, target_key, judgment, chunk_id, source_id,
+                document_title, page_start, page_end, section, excerpt,
+                source_filter, section_filter, content_filter, date_filter,
+                result_rank, rerank_logit, final_score, reranker_model,
+                reranker_fingerprint, reason, expected_source_id,
+                expected_page, created_at, updated_at
+            FROM retrieval_feedback_legacy
+            """
+        )
+        connection.execute("DROP TABLE retrieval_feedback_legacy")
+        connection.execute(
+            "CREATE INDEX idx_feedback_updated ON retrieval_feedback(updated_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_feedback_judgment "
+            "ON retrieval_feedback(judgment, updated_at DESC)"
+        )
 
     @staticmethod
     def _ensure_column(
@@ -504,10 +740,25 @@ class WorkspaceStore:
             raise ValueError("Search query is required")
         if judgment not in FEEDBACK_JUDGMENTS:
             raise ValueError("Unknown feedback judgment")
-        if judgment != "no_relevant_result" and not chunk_id:
+        if judgment in {"relevant", "wrong_passage", "wrong_document"} and not chunk_id:
             raise ValueError("A result chunk is required for this judgment")
 
-        target_key = chunk_id or "__no_relevant_result__"
+        expected_source_id = str(
+            payload.get("expected_source_id") or payload.get("source_id") or ""
+        ).strip()[:1000]
+        expected_page = _optional_positive_int(
+            payload.get("expected_page") or payload.get("page_start")
+        )
+        if judgment == "expected_passage" and not (expected_source_id and expected_page):
+            raise ValueError("An expected document and page are required")
+        if chunk_id:
+            target_key = chunk_id
+        elif judgment == "expected_passage":
+            target_key = f"__expected__:{expected_source_id}:{expected_page or ''}"
+        elif judgment == "ambiguous":
+            target_key = "__ambiguous__"
+        else:
+            target_key = "__no_relevant_result__"
         source_filter = str(payload.get("source_filter") or "").strip()[:1000]
         section_filter = str(payload.get("section_filter") or "").strip()[:1000]
         content_filter = str(payload.get("content_filter") or "").strip()[:100]
@@ -537,6 +788,9 @@ class WorkspaceStore:
             _optional_finite_float(payload.get("final_score")),
             reranker_model,
             reranker_fingerprint,
+            str(payload.get("reason") or "").strip()[:4000],
+            expected_source_id,
+            expected_page,
             now,
             now,
         )
@@ -548,11 +802,12 @@ class WorkspaceStore:
                     document_title, page_start, page_end, section, excerpt,
                     source_filter, section_filter, content_filter, date_filter,
                     result_rank, rerank_logit, final_score, reranker_model,
-                    reranker_fingerprint, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reranker_fingerprint, reason, expected_source_id,
+                    expected_page, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(
                     query, source_filter, section_filter, content_filter,
-                    date_filter, target_key
+                    date_filter, target_key, reranker_fingerprint
                 ) DO UPDATE SET
                     judgment = excluded.judgment,
                     chunk_id = excluded.chunk_id,
@@ -567,6 +822,9 @@ class WorkspaceStore:
                     final_score = excluded.final_score,
                     reranker_model = excluded.reranker_model,
                     reranker_fingerprint = excluded.reranker_fingerprint,
+                    reason = excluded.reason,
+                    expected_source_id = excluded.expected_source_id,
+                    expected_page = excluded.expected_page,
                     updated_at = excluded.updated_at
                 """,
                 values,
@@ -576,6 +834,7 @@ class WorkspaceStore:
                 SELECT * FROM retrieval_feedback
                 WHERE query = ? AND source_filter = ? AND section_filter = ?
                   AND content_filter = ? AND date_filter = ? AND target_key = ?
+                  AND reranker_fingerprint = ?
                 """,
                 (
                     query,
@@ -584,6 +843,7 @@ class WorkspaceStore:
                     content_filter,
                     date_filter,
                     target_key,
+                    reranker_fingerprint,
                 ),
             ).fetchone()
         self.calibrate_feedback(
@@ -600,14 +860,19 @@ class WorkspaceStore:
         self,
         limit: int = 200,
         judgment: str | None = None,
+        reranker_fingerprint: str | None = None,
     ) -> list[dict[str, Any]]:
         parameters: list[Any] = []
-        where = ""
+        conditions: list[str] = []
         if judgment:
             if judgment not in FEEDBACK_JUDGMENTS:
                 raise ValueError("Unknown feedback judgment")
-            where = "WHERE judgment = ?"
+            conditions.append("judgment = ?")
             parameters.append(judgment)
+        if reranker_fingerprint is not None:
+            conditions.append("reranker_fingerprint = ?")
+            parameters.append(str(reranker_fingerprint))
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         parameters.append(min(max(int(limit), 1), 2000))
         with self.connect() as connection:
             rows = connection.execute(
@@ -652,11 +917,19 @@ class WorkspaceStore:
             )
         return cursor.rowcount > 0
 
-    def benchmark_cases_from_feedback(self) -> list[dict[str, Any]]:
+    def benchmark_cases_from_feedback(
+        self,
+        reranker_fingerprint: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Create evaluation cases only from unambiguous human judgments."""
 
         groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
-        for item in reversed(self.list_feedback(limit=2000)):
+        for item in reversed(
+            self.list_feedback(
+                limit=2000,
+                reranker_fingerprint=reranker_fingerprint,
+            )
+        ):
             key = (
                 str(item["query"]).casefold().strip(),
                 str(item["source_filter"]),
@@ -668,11 +941,21 @@ class WorkspaceStore:
 
         cases: list[dict[str, Any]] = []
         for rows in groups.values():
+            if any(row["judgment"] == "ambiguous" for row in rows):
+                continue
             relevant = [row for row in rows if row["judgment"] == "relevant"]
+            expected = [
+                row for row in rows if row["judgment"] == "expected_passage"
+            ]
+            hard_negatives = [
+                row
+                for row in rows
+                if row["judgment"] in {"wrong_passage", "wrong_document"}
+            ]
             rejected = any(
                 row["judgment"] == "no_relevant_result" for row in rows
             )
-            if not relevant and not rejected:
+            if not relevant and not expected and not rejected:
                 # Incorrect-result labels are hard negatives, but they do not prove
                 # that the collection has no answer to the query.
                 continue
@@ -680,11 +963,40 @@ class WorkspaceStore:
             case: dict[str, Any] = {
                 "id": f"feedback-{len(cases) + 1:04d}",
                 "query": first["query"],
-                "answerable": bool(relevant),
+                "answerable": bool(relevant or expected),
+                "split": "calibration",
+                "category": "feedback",
+                "language": "und",
             }
             if first["source_filter"]:
                 case["source_filter"] = first["source_filter"]
-            if relevant:
+            if relevant or expected:
+                targets: list[dict[str, Any]] = []
+                seen_targets: set[tuple[str, str, int | None]] = set()
+                for row in relevant:
+                    chunk_id = str(row["chunk_id"] or "")
+                    source_id = str(row["source_id"] or "")
+                    page = _optional_positive_int(row["page_start"])
+                    key = (chunk_id, source_id, page)
+                    if key == ("", "", None) or key in seen_targets:
+                        continue
+                    seen_targets.add(key)
+                    target: dict[str, Any] = {}
+                    if chunk_id:
+                        target["chunk_id"] = chunk_id
+                    if source_id and page is not None:
+                        target.update({"source_id": source_id, "page": page})
+                    targets.append(target)
+                for row in expected:
+                    source_id = str(row["expected_source_id"] or "")
+                    page = _optional_positive_int(row["expected_page"])
+                    key = ("", source_id, page)
+                    if not source_id or page is None or key in seen_targets:
+                        continue
+                    seen_targets.add(key)
+                    targets.append({"source_id": source_id, "page": page})
+                if targets:
+                    case["relevant_targets"] = targets
                 case["relevant_chunk_ids"] = list(
                     dict.fromkeys(row["chunk_id"] for row in relevant if row["chunk_id"])
                 )
@@ -700,18 +1012,475 @@ class WorkspaceStore:
                         continue
                     seen_locations.add(location_key)
                     locations.append({"source_id": source_id, "page": page})
+                for row in expected:
+                    source_id = str(row["expected_source_id"] or "")
+                    page = _optional_positive_int(row["expected_page"])
+                    if not source_id or page is None:
+                        continue
+                    location_key = (source_id, page)
+                    if location_key in seen_locations:
+                        continue
+                    seen_locations.add(location_key)
+                    locations.append({"source_id": source_id, "page": page})
                 if locations:
                     case["relevant_locations"] = locations
+            hard_negative_ids = list(
+                dict.fromkeys(
+                    str(row["chunk_id"])
+                    for row in hard_negatives
+                    if row["chunk_id"]
+                )
+            )
+            if hard_negative_ids:
+                case["hard_negative_chunk_ids"] = hard_negative_ids
             cases.append(case)
         return cases
 
-    def benchmark_jsonl(self) -> str:
-        cases = self.benchmark_cases_from_feedback()
+    def benchmark_jsonl(self, reranker_fingerprint: str | None = None) -> str:
+        cases = self.benchmark_cases_from_feedback(reranker_fingerprint)
         if not cases:
             return ""
         return "\n".join(
             json.dumps(case, ensure_ascii=False, sort_keys=True) for case in cases
         ) + "\n"
+
+    @staticmethod
+    def _validate_benchmark_jsonl(content: str) -> tuple[str, int, dict[str, Any]]:
+        normalized: list[str] = []
+        splits: dict[str, int] = {}
+        categories: dict[str, int] = {}
+        languages: dict[str, int] = {}
+        hard_negative_count = 0
+        for line_number, raw in enumerate(str(content).splitlines(), start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                case = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid benchmark JSON on line {line_number}: {error.msg}"
+                ) from error
+            if not isinstance(case, dict) or not str(case.get("query") or "").strip():
+                raise ValueError(f"Benchmark line {line_number} needs a query.")
+            case = dict(case)
+            case["query"] = str(case["query"]).strip()
+            case["id"] = str(case.get("id") or f"case-{line_number:04d}")[:200]
+            split = str(case.get("split") or "test").strip().casefold()
+            if split not in {"calibration", "test"}:
+                raise ValueError(
+                    f"Benchmark line {line_number} split must be calibration or test."
+                )
+            category = str(case.get("category") or "general").strip()[:120] or "general"
+            language = str(case.get("language") or "und").strip()[:40] or "und"
+            case["split"] = split
+            case["category"] = category
+            case["language"] = language
+            for key in ("relevant_chunk_ids", "hard_negative_chunk_ids"):
+                values = case.get(key) or []
+                if not isinstance(values, list):
+                    raise ValueError(f"Benchmark line {line_number} {key} must be a list.")
+                case[key] = list(
+                    dict.fromkeys(str(value).strip() for value in values if str(value).strip())
+                )
+            locations = case.get("relevant_locations") or []
+            if not isinstance(locations, list):
+                raise ValueError(
+                    f"Benchmark line {line_number} relevant_locations must be a list."
+                )
+            clean_locations: list[dict[str, Any]] = []
+            for location in locations:
+                if not isinstance(location, dict):
+                    raise ValueError(
+                        f"Benchmark line {line_number} has an invalid relevant location."
+                    )
+                source_id = str(location.get("source_id") or "").strip()
+                page = _optional_positive_int(location.get("page"))
+                if not source_id or page is None:
+                    raise ValueError(
+                        f"Benchmark line {line_number} locations need source_id and page."
+                    )
+                clean_locations.append({"source_id": source_id, "page": page})
+            case["relevant_locations"] = clean_locations
+            targets = case.get("relevant_targets") or []
+            if not isinstance(targets, list):
+                raise ValueError(
+                    f"Benchmark line {line_number} relevant_targets must be a list."
+                )
+            clean_targets: list[dict[str, Any]] = []
+            seen_targets: set[tuple[str, str, int | None]] = set()
+            for target in targets:
+                if not isinstance(target, dict):
+                    raise ValueError(
+                        f"Benchmark line {line_number} has an invalid relevance target."
+                    )
+                chunk_id = str(target.get("chunk_id") or "").strip()
+                source_id = str(target.get("source_id") or "").strip()
+                page = _optional_positive_int(target.get("page"))
+                if not chunk_id and (not source_id or page is None):
+                    raise ValueError(
+                        f"Benchmark line {line_number} relevance targets need "
+                        "a chunk_id or source_id and page."
+                    )
+                key = (chunk_id, source_id, page)
+                if key in seen_targets:
+                    continue
+                seen_targets.add(key)
+                clean_target: dict[str, Any] = {}
+                if chunk_id:
+                    clean_target["chunk_id"] = chunk_id
+                if source_id and page is not None:
+                    clean_target.update({"source_id": source_id, "page": page})
+                clean_targets.append(clean_target)
+            case["relevant_targets"] = clean_targets
+            if bool(case.get("answerable", True)) and not (
+                case.get("relevant_targets")
+                or case.get("relevant_chunk_ids")
+                or case.get("relevant_locations")
+            ):
+                raise ValueError(
+                    f"Answerable benchmark line {line_number} needs a relevant chunk or location."
+                )
+            splits[split] = splits.get(split, 0) + 1
+            categories[category] = categories.get(category, 0) + 1
+            languages[language] = languages.get(language, 0) + 1
+            hard_negative_count += len(case["hard_negative_chunk_ids"])
+            normalized.append(json.dumps(case, ensure_ascii=False, sort_keys=True))
+        if not normalized:
+            raise ValueError("The benchmark contains no cases.")
+        metadata = {
+            "splits": splits,
+            "categories": categories,
+            "languages": languages,
+            "hard_negative_count": hard_negative_count,
+        }
+        return "\n".join(normalized) + "\n", len(normalized), metadata
+
+    def save_benchmark(self, name: str, content: str) -> dict[str, Any]:
+        name = str(name or "").strip()[:160]
+        if not name:
+            raise ValueError("Benchmark name is required.")
+        if len(content.encode("utf-8")) > 10 * 1024 * 1024:
+            raise ValueError("Benchmark files are limited to 10 MB.")
+        normalized, case_count, metadata = self._validate_benchmark_jsonl(content)
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+        now = utc_now()
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id, version, content_hash FROM quality_benchmarks WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if existing is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO quality_benchmarks(
+                        name, version, content_hash, case_count, content_jsonl,
+                        metadata_json, created_at, updated_at
+                    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (name, digest, case_count, normalized, metadata_json, now, now),
+                )
+                benchmark_id = int(cursor.lastrowid)
+                version = 1
+            else:
+                benchmark_id = int(existing["id"])
+                version = int(existing["version"])
+                if str(existing["content_hash"]) != digest:
+                    version += 1
+                connection.execute(
+                    """
+                    UPDATE quality_benchmarks
+                    SET version = ?, content_hash = ?, case_count = ?,
+                        content_jsonl = ?, metadata_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        version,
+                        digest,
+                        case_count,
+                        normalized,
+                        metadata_json,
+                        now,
+                        benchmark_id,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO quality_benchmark_versions(
+                    benchmark_id, version, content_hash, case_count,
+                    content_jsonl, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    benchmark_id,
+                    version,
+                    digest,
+                    case_count,
+                    normalized,
+                    metadata_json,
+                    now,
+                ),
+            )
+        return self.get_benchmark(benchmark_id)
+
+    @staticmethod
+    def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
+        output = dict(row)
+        try:
+            output["metadata"] = json.loads(str(output.pop("metadata_json", "{}") or "{}"))
+        except json.JSONDecodeError:
+            output["metadata"] = {}
+        return output
+
+    def list_benchmarks(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, name, version, content_hash, case_count,
+                       metadata_json, created_at, updated_at
+                FROM quality_benchmarks ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        return [self._benchmark_row(row) for row in rows]
+
+    def get_benchmark(self, benchmark_id: int, *, include_content: bool = False) -> dict[str, Any]:
+        columns = "*" if include_content else (
+            "id, name, version, content_hash, case_count, metadata_json, "
+            "created_at, updated_at"
+        )
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT {columns} FROM quality_benchmarks WHERE id = ?",
+                (int(benchmark_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(benchmark_id)
+        return self._benchmark_row(row)
+
+    def get_benchmark_version(
+        self,
+        benchmark_id: int,
+        version: int,
+        *,
+        include_content: bool = False,
+    ) -> dict[str, Any]:
+        columns = "*" if include_content else (
+            "id, benchmark_id, version, content_hash, case_count, metadata_json, created_at"
+        )
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT {columns} FROM quality_benchmark_versions "
+                "WHERE benchmark_id = ? AND version = ?",
+                (int(benchmark_id), int(version)),
+            ).fetchone()
+        if row is None:
+            raise KeyError((benchmark_id, version))
+        return self._benchmark_row(row)
+
+    def create_experiment(
+        self,
+        name: str,
+        benchmark_id: int | None,
+        benchmark_name: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        clean_name = str(name or "").strip()[:160] or f"Experiment {now}"
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO quality_experiments(
+                    name, benchmark_id, benchmark_name, status, config_json,
+                    results_json, error, production, created_at, updated_at
+                ) VALUES (?, ?, ?, 'queued', ?, '{}', '', 0, ?, ?)
+                """,
+                (
+                    clean_name,
+                    int(benchmark_id) if benchmark_id is not None else None,
+                    str(benchmark_name)[:160],
+                    json.dumps(config, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            experiment_id = int(cursor.lastrowid)
+        return self.get_experiment(experiment_id)
+
+    @staticmethod
+    def _experiment_row(row: sqlite3.Row) -> dict[str, Any]:
+        output = dict(row)
+        for source, target in (("config_json", "config"), ("results_json", "results")):
+            try:
+                output[target] = json.loads(str(output.pop(source) or "{}"))
+            except json.JSONDecodeError:
+                output[target] = {}
+        output["production"] = bool(output.get("production"))
+        return output
+
+    def get_experiment(self, experiment_id: int) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM quality_experiments WHERE id = ?",
+                (int(experiment_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(experiment_id)
+        return self._experiment_row(row)
+
+    def list_experiments(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM quality_experiments ORDER BY updated_at DESC LIMIT ?",
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [self._experiment_row(row) for row in rows]
+
+    def update_experiment(
+        self,
+        experiment_id: int,
+        *,
+        status: str,
+        results: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"queued", "running", "complete", "failed"}:
+            raise ValueError("Invalid experiment status.")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE quality_experiments
+                SET status = ?, results_json = ?, error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    json.dumps(results or {}, ensure_ascii=False, sort_keys=True),
+                    str(error or "")[:4000],
+                    utc_now(),
+                    int(experiment_id),
+                ),
+            )
+        if not cursor.rowcount:
+            raise KeyError(experiment_id)
+        return self.get_experiment(experiment_id)
+
+    def set_production_experiment(self, experiment_id: int) -> dict[str, Any]:
+        experiment = self.get_experiment(experiment_id)
+        if experiment["status"] != "complete":
+            raise ValueError("Only a completed experiment can become the production default.")
+        regression = (experiment.get("results") or {}).get("regression") or {}
+        if regression and not bool(regression.get("passed", False)):
+            raise ValueError(
+                "This experiment failed its quality regression threshold and cannot become production."
+            )
+        reranker = str((experiment.get("config") or {}).get("reranker") or "")
+        if reranker not in {"gte", "bge"}:
+            raise ValueError(
+                "Production experiments must select exactly one reranker. "
+                "Run GTE or BGE separately before promotion."
+            )
+        with self.connect() as connection:
+            connection.execute("UPDATE quality_experiments SET production = 0")
+            connection.execute(
+                "UPDATE quality_experiments SET production = 1, updated_at = ? WHERE id = ?",
+                (utc_now(), int(experiment_id)),
+            )
+        return self.get_experiment(experiment_id)
+
+    def production_experiment(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM quality_experiments
+                WHERE production = 1 AND status = 'complete'
+                ORDER BY updated_at DESC LIMIT 1
+                """
+            ).fetchone()
+        return self._experiment_row(row) if row is not None else None
+
+    def add_notification(
+        self,
+        *,
+        kind: str,
+        title: str,
+        message: str = "",
+        status: str = "info",
+        task_key: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"info", "success", "warning", "error"}:
+            raise ValueError("Invalid notification status.")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO notifications(
+                    kind, title, message, status, task_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(kind or "system")[:80],
+                    str(title or "Update")[:240],
+                    str(message or "")[:2000],
+                    status,
+                    str(task_key or "")[:200],
+                    utc_now(),
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM notifications WHERE id NOT IN (
+                    SELECT id FROM notifications ORDER BY id DESC LIMIT 500
+                )
+                """
+            )
+            row = connection.execute(
+                "SELECT * FROM notifications WHERE id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def list_notifications(
+        self,
+        *,
+        limit: int = 50,
+        unread_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE read_at IS NULL" if unread_only else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM notifications {where} ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return self._rows(rows)
+
+    def mark_notification_read(self, notification_id: int) -> dict[str, Any]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+                (utc_now(), int(notification_id)),
+            )
+            row = connection.execute(
+                "SELECT * FROM notifications WHERE id = ?",
+                (int(notification_id),),
+            ).fetchone()
+        if not cursor.rowcount or row is None:
+            raise KeyError(notification_id)
+        return dict(row)
+
+    def schema_status(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            migrations = self._rows(
+                connection.execute(
+                    "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+                ).fetchall()
+            )
+        return {
+            "current_version": version,
+            "target_version": WORKSPACE_SCHEMA_VERSION,
+            "migrations": migrations,
+        }
 
     def calibrate_feedback(
         self,
@@ -921,12 +1690,15 @@ class WorkspaceStore:
             rows = connection.execute(
                 """
                 SELECT judgment, COUNT(*) AS count
-                FROM retrieval_feedback GROUP BY judgment
-                """
+                FROM retrieval_feedback
+                WHERE reranker_fingerprint = ?
+                GROUP BY judgment
+                """,
+                (reranker_fingerprint,),
             ).fetchall()
         counts = {judgment: 0 for judgment in FEEDBACK_JUDGMENTS}
         counts.update({str(row["judgment"]): int(row["count"]) for row in rows})
-        cases = self.benchmark_cases_from_feedback()
+        cases = self.benchmark_cases_from_feedback(reranker_fingerprint)
         return {
             "total": sum(counts.values()),
             "counts": counts,

@@ -7,11 +7,13 @@ from ingest import (
     convert_page_range_resilient,
     docling_safe_pdf_path,
     ids_fingerprint,
+    infer_retrieval_unit_type,
     index_commit_window,
     is_cuda_out_of_memory,
     merge_short_chunks,
     report_cuda_headroom,
     split_text_for_retrieval,
+    split_structural_record,
     source_is_current,
     stitch_window_headings,
 )
@@ -79,6 +81,26 @@ def test_parent_text_is_split_into_bounded_overlapping_children() -> None:
     assert len(children) == 3
     assert all(len(child.split()) <= 8 for child in children)
     assert set(children[0].split()[-2:]) <= set(children[1].split()[:2])
+
+
+def test_table_children_repeat_column_headers_and_keep_structural_type() -> None:
+    rows = [
+        "| Requirement | Description |",
+        "| --- | --- |",
+        *[
+            f"| R-{index} | " + " ".join(f"detail{index}_{word}" for word in range(120)) + " |"
+            for index in range(4)
+        ],
+    ]
+    item = record("\n".join(rows), "table", 500)
+
+    children = split_structural_record(item, FakeRuntime())
+
+    assert infer_retrieval_unit_type(item) == "table"
+    assert len(children) > 1
+    assert all(unit_type == "table" for _, unit_type, _ in children)
+    assert all("| Requirement | Description |" in text for text, _, _ in children)
+    assert all(header == "| Requirement | Description |" for _, _, header in children)
 
 
 def test_incomplete_manifest_never_skips_source() -> None:

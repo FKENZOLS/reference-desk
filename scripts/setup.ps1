@@ -52,7 +52,7 @@ Set-Content -LiteralPath ".rag-profile" -Value $Selected -Encoding ascii
 
 & $VenvPython scripts\cache_models.py
 if ($LASTEXITCODE -ne 0) {
-    throw "The public Qwen tokenizer or reranker could not be downloaded. Check the internet connection and retry."
+    throw "The public tokenizer or selectable rerankers could not be downloaded. Check the internet connection and retry."
 }
 
 if (Get-Command ollama -ErrorAction SilentlyContinue) {

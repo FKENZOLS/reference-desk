@@ -44,3 +44,7 @@ evaluation_results*.json
 reference_workspace.sqlite3
 reference_workspace.sqlite3-shm
 reference_workspace.sqlite3-wal
+*.pre-v*-migration.bak
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts

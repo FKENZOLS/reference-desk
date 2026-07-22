@@ -26,6 +26,16 @@ _WINDOWS_RESERVED = {
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
 }
+_PENDING_LIFECYCLE_STATES = {"uploaded", "pending", "processing", "failed"}
+_DOCUMENT_LIFECYCLE_STATES = {
+    "uploaded",
+    "pending",
+    "processing",
+    "indexed",
+    "failed",
+    "quarantined",
+    "deleted",
+}
 
 
 class DocumentPathError(ValueError):
@@ -111,17 +121,178 @@ class DocumentRepository:
         os.replace(temporary, path)
 
     def _state(self) -> dict[str, Any]:
-        state = self._read_json(
+        raw = self._read_json(
             self.state_path,
             {"pending_sources": [], "deleted_sources": []},
         )
+        legacy_pending = {
+            str(item) for item in raw.get("pending_sources", []) if item
+        }
+        legacy_deleted = {
+            str(item) for item in raw.get("deleted_sources", []) if item
+        }
+        state: dict[str, Any] = {
+            "version": 2,
+            "documents": {
+                str(source): dict(entry)
+                for source, entry in (raw.get("documents") or {}).items()
+                if source and isinstance(entry, dict)
+            },
+        }
+        migrated = int(raw.get("version") or 1) < 2 or "documents" not in raw
+        if migrated:
+            manifest = self._read_json(self.manifest_path, {"sources": {}})
+            manifest_sources = manifest.get("sources") or {}
+            sources = set(legacy_pending) | set(legacy_deleted)
+            if self.pdf_dir.exists():
+                sources.update(
+                    path.resolve().relative_to(self.pdf_dir).as_posix()
+                    for path in self.pdf_dir.rglob("*.pdf")
+                    if path.is_file()
+                )
+            now = datetime.now(tz=UTC).isoformat()
+            for source_id in sorted(sources):
+                manifest_entry = manifest_sources.get(source_id) or {}
+                if source_id in legacy_deleted:
+                    status = "deleted"
+                elif source_id in legacy_pending:
+                    status = "pending"
+                elif manifest_entry.get("complete") is True:
+                    status = "indexed"
+                else:
+                    status = "pending"
+                state["documents"].setdefault(
+                    source_id,
+                    {
+                        "status": status,
+                        "indexed_file_hash": str(manifest_entry.get("file_hash") or ""),
+                        "current_file_hash": "",
+                        "error": "",
+                        "index_removal_pending": source_id in legacy_deleted,
+                        "updated_at": now,
+                        "history": [
+                            {
+                                "from": None,
+                                "to": status,
+                                "at": now,
+                                "reason": "Migrated legacy document state",
+                            }
+                        ],
+                    },
+                )
+        for source_id, entry in state["documents"].items():
+            status = str(entry.get("status") or "pending")
+            entry["status"] = status if status in _DOCUMENT_LIFECYCLE_STATES else "pending"
+            entry["indexed_file_hash"] = str(entry.get("indexed_file_hash") or "")
+            entry["current_file_hash"] = str(entry.get("current_file_hash") or "")
+            entry["error"] = str(entry.get("error") or "")
+            entry["index_removal_pending"] = bool(entry.get("index_removal_pending"))
+            entry["updated_at"] = str(entry.get("updated_at") or "")
+            entry["history"] = [
+                dict(event)
+                for event in entry.get("history", [])
+                if isinstance(event, dict)
+            ][-100:]
+        self._sync_legacy_views(state)
+        if migrated:
+            backup = self.state_path.with_name(
+                f"{self.state_path.name}.pre-v2-migration.bak"
+            )
+            if self.state_path.exists() and not backup.exists():
+                shutil.copy2(self.state_path, backup)
+            self._write_json(self.state_path, state)
+        return state
+
+    @staticmethod
+    def _sync_legacy_views(state: dict[str, Any]) -> None:
+        documents = state.get("documents") or {}
         state["pending_sources"] = sorted(
-            {str(item) for item in state.get("pending_sources", []) if item}
+            source_id
+            for source_id, entry in documents.items()
+            if str(entry.get("status")) in _PENDING_LIFECYCLE_STATES
         )
         state["deleted_sources"] = sorted(
-            {str(item) for item in state.get("deleted_sources", []) if item}
+            source_id
+            for source_id, entry in documents.items()
+            if bool(entry.get("index_removal_pending"))
         )
-        return state
+
+    @staticmethod
+    def _transition_in_state(
+        state: dict[str, Any],
+        source_id: str,
+        status: str,
+        *,
+        reason: str = "",
+        file_hash: str = "",
+        error: str = "",
+        index_removal_pending: bool | None = None,
+    ) -> dict[str, Any]:
+        if status not in _DOCUMENT_LIFECYCLE_STATES:
+            raise ValueError(f"Unsupported document lifecycle state: {status}")
+        now = datetime.now(tz=UTC).isoformat()
+        documents = state.setdefault("documents", {})
+        entry = documents.setdefault(
+            source_id,
+            {
+                "status": "uploaded",
+                "indexed_file_hash": "",
+                "current_file_hash": "",
+                "error": "",
+                "index_removal_pending": False,
+                "updated_at": now,
+                "history": [],
+            },
+        )
+        previous = str(entry.get("status") or "uploaded")
+        if previous != status or reason or error:
+            entry.setdefault("history", []).append(
+                {
+                    "from": previous if entry.get("history") else None,
+                    "to": status,
+                    "at": now,
+                    "reason": str(reason or "")[:500],
+                    "file_hash": str(file_hash or ""),
+                    "error": str(error or "")[:2000],
+                }
+            )
+            entry["history"] = entry["history"][-100:]
+        entry["status"] = status
+        entry["updated_at"] = now
+        entry["error"] = str(error or "")[:2000]
+        if file_hash:
+            entry["current_file_hash"] = str(file_hash)
+            if status == "indexed":
+                entry["indexed_file_hash"] = str(file_hash)
+        if index_removal_pending is not None:
+            entry["index_removal_pending"] = bool(index_removal_pending)
+        DocumentRepository._sync_legacy_views(state)
+        return entry
+
+    def transition(
+        self,
+        source_id: str,
+        status: str,
+        *,
+        reason: str = "",
+        file_hash: str = "",
+        error: str = "",
+        index_removal_pending: bool | None = None,
+    ) -> dict[str, Any]:
+        normalized = self.normalize_source_id(source_id)
+        with self._lock:
+            state = self._state()
+            entry = self._transition_in_state(
+                state,
+                normalized,
+                status,
+                reason=reason,
+                file_hash=file_hash,
+                error=error,
+                index_removal_pending=index_removal_pending,
+            )
+            self._write_json(self.state_path, state)
+            return dict(entry)
 
     def _mark_changes(
         self,
@@ -131,14 +302,44 @@ class DocumentRepository:
         remove_deleted: tuple[str, ...] = (),
     ) -> None:
         state = self._state()
-        pending_set = set(state["pending_sources"])
-        deleted_set = set(state["deleted_sources"])
-        pending_set.update(pending)
-        deleted_set.update(deleted)
-        deleted_set.difference_update(remove_deleted)
-        pending_set.difference_update(deleted_set)
-        state["pending_sources"] = sorted(pending_set)
-        state["deleted_sources"] = sorted(deleted_set)
+        for source_id in pending:
+            existing = state["documents"].get(source_id)
+            migrated_placeholder = bool(
+                existing
+                and len(existing.get("history") or []) == 1
+                and str((existing.get("history") or [{}])[0].get("reason") or "")
+                == "Migrated legacy document state"
+                and existing.get("status") == "pending"
+            )
+            if source_id not in state["documents"] or migrated_placeholder:
+                if migrated_placeholder:
+                    state["documents"].pop(source_id, None)
+                self._transition_in_state(
+                    state,
+                    source_id,
+                    "uploaded",
+                    reason="Document added to the library",
+                )
+            self._transition_in_state(
+                state,
+                source_id,
+                "pending",
+                reason="Waiting for indexing",
+                index_removal_pending=False,
+            )
+        for source_id in deleted:
+            self._transition_in_state(
+                state,
+                source_id,
+                "deleted",
+                reason="Document removed from the active library",
+                index_removal_pending=True,
+            )
+        for source_id in remove_deleted:
+            entry = state["documents"].get(source_id)
+            if entry is not None:
+                entry["index_removal_pending"] = False
+        self._sync_legacy_views(state)
         self._write_json(self.state_path, state)
 
     def _page_count(self, path: Path) -> int | None:
@@ -212,7 +413,7 @@ class DocumentRepository:
             manifest = self._read_json(self.manifest_path, {"sources": {}})
             manifest_sources = manifest.get("sources") or {}
             state = self._state()
-            pending = set(state["pending_sources"])
+            state_changed = False
             revision_counts: dict[str, int] = {}
             for revision in self.list_revisions():
                 source = str(revision.get("source_id") or "")
@@ -222,14 +423,56 @@ class DocumentRepository:
                 if not path.is_file():
                     continue
                 source_id = path.resolve().relative_to(self.pdf_dir).as_posix()
-                entry = manifest_sources.get(source_id) or {}
+                manifest_entry = manifest_sources.get(source_id) or {}
+                lifecycle = state["documents"].get(source_id)
+                if lifecycle is None:
+                    self._transition_in_state(
+                        state,
+                        source_id,
+                        "uploaded",
+                        reason="Document discovered in the library",
+                    )
+                    lifecycle = self._transition_in_state(
+                        state,
+                        source_id,
+                        "pending",
+                        reason="Waiting for indexing",
+                    )
+                    state_changed = True
                 stat = path.stat()
-                if source_id in pending:
-                    status = "pending"
-                elif entry.get("complete") is True:
-                    status = "indexed"
-                else:
-                    status = "not_indexed"
+                current_hash = ""
+                if (
+                    lifecycle.get("status") == "pending"
+                    and manifest_entry.get("complete") is True
+                    and manifest_entry.get("file_hash")
+                ):
+                    current_hash = self._file_hash(path)
+                    if str(manifest_entry["file_hash"]) == current_hash:
+                        lifecycle = self._transition_in_state(
+                            state,
+                            source_id,
+                            "indexed",
+                            reason="Reconciled completed manifest",
+                            file_hash=current_hash,
+                        )
+                        state_changed = True
+                indexed_hash = str(
+                    lifecycle.get("indexed_file_hash")
+                    or manifest_entry.get("file_hash")
+                    or ""
+                )
+                if lifecycle.get("status") == "indexed" and indexed_hash:
+                    current_hash = current_hash or self._file_hash(path)
+                    if current_hash != indexed_hash:
+                        lifecycle = self._transition_in_state(
+                            state,
+                            source_id,
+                            "pending",
+                            reason="File content changed after indexing",
+                            file_hash=current_hash,
+                        )
+                        state_changed = True
+                status = str(lifecycle.get("status") or "pending")
                 parent = PurePosixPath(source_id).parent.as_posix()
                 documents.append(
                     {
@@ -242,12 +485,19 @@ class DocumentRepository:
                             tz=UTC,
                         ).isoformat(),
                         "pages": self._page_count(path),
-                        "chunks": int(entry.get("chunk_count") or 0),
+                        "chunks": int(manifest_entry.get("chunk_count") or 0),
                         "status": status,
-                        "file_hash": str(entry.get("file_hash") or ""),
+                        "file_hash": indexed_hash,
+                        "indexed_file_hash": indexed_hash,
+                        "state_updated_at": str(lifecycle.get("updated_at") or ""),
+                        "state_error": str(lifecycle.get("error") or ""),
+                        "state_history": list(lifecycle.get("history") or []),
                         "revision_count": revision_counts.get(source_id, 0),
                     }
                 )
+            if state_changed:
+                self._sync_legacy_views(state)
+                self._write_json(self.state_path, state)
             return documents
 
     def list_trash(self) -> list[dict[str, Any]]:
@@ -310,6 +560,12 @@ class DocumentRepository:
         with self._lock:
             if not source.is_file():
                 raise FileNotFoundError(normalized)
+            self.transition(
+                normalized,
+                "failed",
+                reason="Ingestion failed",
+                error=str(error or "Unknown ingestion error"),
+            )
             quarantine_id = (
                 datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S")
                 + "-"
@@ -328,7 +584,14 @@ class DocumentRepository:
             }
             self._write_json(entry_dir / "record.json", record)
             self._remove_empty_parents(source.parent)
-            self._mark_changes(deleted=(normalized,))
+            self.transition(
+                normalized,
+                "quarantined",
+                reason="Ingestion failed; document moved to quarantine",
+                file_hash=str(record["file_hash"]),
+                error=str(record["error"]),
+                index_removal_pending=True,
+            )
             return {**record, "size": destination.stat().st_size}
 
     def restore_quarantine(self, quarantine_id: str) -> dict[str, str]:
@@ -542,10 +805,22 @@ class DocumentRepository:
 
     def clear_pending(self) -> None:
         with self._lock:
-            self._write_json(
-                self.state_path,
-                {"pending_sources": [], "deleted_sources": []},
-            )
+            state = self._state()
+            manifest = self._read_json(self.manifest_path, {"sources": {}})
+            manifest_sources = manifest.get("sources") or {}
+            for source_id, entry in list(state["documents"].items()):
+                if str(entry.get("status")) in _PENDING_LIFECYCLE_STATES:
+                    manifest_entry = manifest_sources.get(source_id) or {}
+                    self._transition_in_state(
+                        state,
+                        source_id,
+                        "indexed",
+                        reason="Index update completed",
+                        file_hash=str(manifest_entry.get("file_hash") or ""),
+                    )
+                entry["index_removal_pending"] = False
+            self._sync_legacy_views(state)
+            self._write_json(self.state_path, state)
 
     def clear_pending_sources(
         self,
@@ -554,12 +829,22 @@ class DocumentRepository:
     ) -> None:
         with self._lock:
             state = self._state()
-            state["pending_sources"] = sorted(
-                set(state["pending_sources"]) - set(sources)
-            )
-            state["deleted_sources"] = sorted(
-                set(state["deleted_sources"]) - set(deleted)
-            )
+            manifest = self._read_json(self.manifest_path, {"sources": {}})
+            manifest_sources = manifest.get("sources") or {}
+            for source_id in sources:
+                manifest_entry = manifest_sources.get(source_id) or {}
+                self._transition_in_state(
+                    state,
+                    source_id,
+                    "indexed",
+                    reason="Index update completed",
+                    file_hash=str(manifest_entry.get("file_hash") or ""),
+                )
+            for source_id in deleted:
+                entry = state["documents"].get(source_id)
+                if entry is not None:
+                    entry["index_removal_pending"] = False
+            self._sync_legacy_views(state)
             self._write_json(self.state_path, state)
 
     def _remove_empty_parents(self, start: Path) -> None:

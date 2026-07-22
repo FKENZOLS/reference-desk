@@ -87,6 +87,86 @@ def test_indexed_status_uses_manifest_and_sync_clears_pending(tmp_path) -> None:
     assert document["chunks"] == 18
 
 
+def test_completed_matching_manifest_reconciles_stale_pending_marker(tmp_path) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(temporary_pdf(tmp_path), "manual.pdf")
+    digest = repo._file_hash(repo.resolve_source("manual.pdf"))
+    repo.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    repo.manifest_path.write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "manual.pdf": {
+                        "complete": True,
+                        "chunk_count": 18,
+                        "file_hash": digest,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = repo.summary()
+
+    assert summary["documents"][0]["status"] == "indexed"
+    assert summary["pending_sources"] == []
+    state = json.loads(repo.state_path.read_text(encoding="utf-8"))
+    assert state["pending_sources"] == []
+
+
+def test_changed_file_does_not_reconcile_stale_pending_marker(tmp_path) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(temporary_pdf(tmp_path), "manual.pdf")
+    repo.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    repo.manifest_path.write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "manual.pdf": {
+                        "complete": True,
+                        "chunk_count": 18,
+                        "file_hash": "different-content-hash",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert repo.summary()["documents"][0]["status"] == "pending"
+
+
+def test_document_lifecycle_keeps_hash_and_transition_history(tmp_path) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(temporary_pdf(tmp_path), "manual.pdf")
+    initial = repo.summary()["documents"][0]
+    assert initial["status"] == "pending"
+    assert [event["to"] for event in initial["state_history"]][-2:] == [
+        "uploaded",
+        "pending",
+    ]
+
+    repo.transition("manual.pdf", "processing", reason="test worker started")
+    digest = repo._file_hash(repo.resolve_source("manual.pdf"))
+    repo.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    repo.manifest_path.write_text(
+        json.dumps(
+            {"sources": {"manual.pdf": {"complete": True, "file_hash": digest}}}
+        ),
+        encoding="utf-8",
+    )
+    repo.clear_pending_sources(("manual.pdf",), ())
+
+    indexed = repo.summary()["documents"][0]
+    assert indexed["status"] == "indexed"
+    assert indexed["indexed_file_hash"] == digest
+    assert [event["to"] for event in indexed["state_history"]][-2:] == [
+        "processing",
+        "indexed",
+    ]
+
+
 def test_move_delete_and_restore_are_recoverable(tmp_path) -> None:
     repo = repository(tmp_path)
     repo.commit_upload(temporary_pdf(tmp_path), "manual.pdf")
