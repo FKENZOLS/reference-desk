@@ -393,6 +393,31 @@ class CorpusScaleManager:
                 self.invalidate_health()
             return reconciled
 
+    def reconcile_completed_removals(self, summary: dict[str, Any]) -> list[str]:
+        """Clear removal markers only when no index layer retains the source."""
+
+        pending_removals = {
+            str(source_id)
+            for source_id in summary.get("deleted_sources", [])
+            if source_id
+        }
+        if not pending_removals:
+            return []
+        try:
+            snapshot = self._index_snapshot()
+        except (OSError, sqlite3.Error):
+            return []
+        indexed_sources = set().union(
+            snapshot["manifest_sources"],
+            snapshot["dense_sources"],
+            snapshot["lexical_sources"],
+        )
+        reconciled = sorted(pending_removals - indexed_sources)
+        if reconciled:
+            self.repository.clear_pending_sources((), tuple(reconciled))
+            self.invalidate_health()
+        return reconciled
+
     def invalidate_health(self) -> None:
         self._health_cache = None
 
@@ -644,7 +669,9 @@ class CorpusScaleManager:
             raise
 
     def _rebuild_chroma_index(self, expected_chunks: int) -> bool:
-        if expected_chunks <= 0 or not (self.db_dir / "chroma.sqlite3").is_file():
+        if expected_chunks < 0:
+            raise ValueError("Expected chunk count cannot be negative.")
+        if not (self.db_dir / "chroma.sqlite3").is_file():
             return False
 
         import chromadb
@@ -662,16 +689,36 @@ class CorpusScaleManager:
             source_client = chromadb.PersistentClient(path=str(self.db_dir))
             target_client = chromadb.PersistentClient(path=str(rebuilt_root))
             try:
-                source = source_client.get_collection(self.collection_name)
-                hnsw = dict((source.configuration or {}).get("hnsw") or {})
+                source = next(
+                    (
+                        collection
+                        for collection in source_client.list_collections()
+                        if collection.name == self.collection_name
+                    ),
+                    None,
+                )
+                if source is None and expected_chunks:
+                    raise RuntimeError(
+                        f"Chroma collection {self.collection_name!r} is missing."
+                    )
+                hnsw = (
+                    dict((source.configuration or {}).get("hnsw") or {})
+                    if source is not None
+                    else {}
+                )
                 hnsw.pop("embedding_function", None)
+                metadata = (
+                    dict(source.metadata or {}) if source is not None else {}
+                )
                 target = target_client.create_collection(
                     name=self.collection_name,
-                    metadata=dict(source.metadata or {}),
+                    metadata=metadata or None,
                     configuration={"hnsw": hnsw} if hnsw else None,
                 )
                 batch_size = 250
                 for offset in range(0, expected_chunks, batch_size):
+                    if source is None:
+                        raise RuntimeError("The source Chroma collection is unavailable.")
                     batch = source.get(
                         limit=batch_size,
                         offset=offset,

@@ -115,6 +115,23 @@ def test_failed_document_quarantine_is_recoverable(tmp_path: Path) -> None:
     assert "broken.pdf" in repo.summary()["pending_sources"]
 
 
+def test_completed_quarantine_removal_is_reconciled_from_all_indexes(
+    tmp_path: Path,
+) -> None:
+    repo = repository(tmp_path)
+    repo.commit_upload(pdf(tmp_path, "broken.part"), "broken.pdf")
+    repo.quarantine("broken.pdf", "No usable page text")
+    corpus = manager(tmp_path, repo)
+
+    assert repo.summary()["deleted_sources"] == ["broken.pdf"]
+    assert corpus.reconcile_completed_removals(repo.summary()) == ["broken.pdf"]
+
+    summary = repo.summary()
+    assert summary["deleted_sources"] == []
+    assert summary["counts"]["pending"] == 0
+    assert summary["counts"]["quarantine"] == 1
+
+
 def test_health_reports_storage_and_preexisting_duplicates(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     repo.pdf_dir.mkdir(parents=True)
@@ -267,5 +284,50 @@ def test_storage_optimization_rebuilds_and_verifies_only_active_index(
         rebuilt = reopened.get_collection("technical_docs_qwen_v1")
         assert rebuilt.count() == 2
         assert set(rebuilt.get(include=[])["ids"]) == {"chunk-1", "chunk-2"}
+    finally:
+        reopened.close()
+
+
+def test_storage_optimization_rebuilds_an_empty_dense_index(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    repo.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    repo.manifest_path.write_text(
+        json.dumps({"version": 2, "sources": {}}),
+        encoding="utf-8",
+    )
+
+    dense_client = chromadb.PersistentClient(path=str(tmp_path / "db"))
+    dense = dense_client.get_or_create_collection("technical_docs_qwen_v1")
+    dense.add(
+        ids=["deleted-chunk"],
+        embeddings=[[1.0, 0.0, 0.0]],
+        documents=["deleted passage"],
+        metadatas=[{"source_id": "deleted.pdf"}],
+    )
+    dense.delete(ids=["deleted-chunk"])
+    dense_client.close()
+    replace_source(
+        path=tmp_path / "db" / "lexical.sqlite3",
+        source_id="deleted.pdf",
+        documents=[],
+        ids=[],
+    )
+
+    old_segments = {
+        path.name
+        for path in (tmp_path / "db").iterdir()
+        if path.is_dir() and (path / "header.bin").is_file()
+    }
+    assert old_segments
+
+    result = manager(tmp_path, repo).optimize_storage()
+
+    assert result["dense_index_rebuilt"] is True
+    assert result["chunks_verified"] == 0
+    assert result["sources_verified"] == 0
+    assert not any((tmp_path / "db" / name).exists() for name in old_segments)
+    reopened = chromadb.PersistentClient(path=str(tmp_path / "db"))
+    try:
+        assert reopened.get_collection("technical_docs_qwen_v1").count() == 0
     finally:
         reopened.close()

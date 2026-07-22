@@ -460,6 +460,99 @@ def test_successful_background_job_clears_pending_changes(monkeypatch) -> None:
     assert not search_app._DOCUMENT_MAINTENANCE.is_set()
 
 
+def test_quarantine_finalization_clears_its_index_removal_marker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    cleared = []
+    process_results = [
+        (
+            [
+                'CORPUS_EVENT {"event":"failed","source_id":"broken.pdf",'
+                '"error_type":"RuntimeError","error":"missing page text"}\n'
+            ],
+            1,
+        ),
+        (["Pruned documents: 1\n"], 0),
+    ]
+
+    class FakeProcess:
+        def __init__(self, lines, exit_code):
+            self.stdout = iter(lines)
+            self.exit_code = exit_code
+
+        def wait(self):
+            return self.exit_code
+
+    class FakeRepository:
+        def quarantine(self, source_id, error):
+            assert source_id == "broken.pdf"
+            return {"source_id": source_id, "error": error}
+
+        def clear_pending_sources(self, sources=(), deleted=()):
+            cleared.append((sources, deleted))
+
+    fake_repository = FakeRepository()
+
+    class FakeCorpus:
+        repository = fake_repository
+        state_path = tmp_path / "queue.json"
+
+        @staticmethod
+        def queued_sources():
+            return ["broken.pdf"]
+
+        @staticmethod
+        def snapshot():
+            return {
+                "remaining": 0,
+                "counts": {"quarantined": 1},
+                "items": [
+                    {
+                        "source_id": "broken.pdf",
+                        "status": "quarantined",
+                    }
+                ],
+            }
+
+        @staticmethod
+        def mark_event(source_id, status, error=""):
+            return None
+
+        @staticmethod
+        def mark_deletions_complete():
+            return []
+
+        @staticmethod
+        def invalidate_health():
+            return None
+
+    def launch(*args, **kwargs):
+        lines, exit_code = process_results.pop(0)
+        return FakeProcess(lines, exit_code)
+
+    monkeypatch.setattr(search_app, "DOCUMENT_REPOSITORY", fake_repository)
+    monkeypatch.setattr(search_app, "CORPUS_SCALE", FakeCorpus())
+    monkeypatch.setattr(search_app, "_release_search_runtime", lambda: None)
+    monkeypatch.setattr(search_app, "_unload_ollama_embedding_model", lambda: None)
+    monkeypatch.setattr(search_app, "_notify", lambda **kwargs: None)
+    monkeypatch.setattr(search_app.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        search_app,
+        "_DOCUMENT_JOB",
+        {"state": "queued", "running": True, "message": "", "log": []},
+    )
+    search_app._DOCUMENT_MAINTENANCE.set()
+
+    search_app._run_document_index_job(False)
+
+    assert cleared == [((), ("broken.pdf",))]
+    job = search_app.document_job_snapshot()
+    assert job["state"] == "complete_with_failures"
+    assert job["running"] is False
+    assert not search_app._DOCUMENT_MAINTENANCE.is_set()
+
+
 def test_auto_indexing_retries_exclusively_when_gpu_headroom_changes(
     tmp_path,
     monkeypatch,

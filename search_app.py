@@ -1179,6 +1179,12 @@ def _run_document_index_job(
                 not queue_after_run.get("remaining")
                 or exit_code == PAUSED_EXIT_CODE
             ):
+                _update_document_job(
+                    state="finalizing",
+                    message=(
+                        "Removing stale index entries for quarantined documents."
+                    ),
+                )
                 _append_document_job_log(
                     "Finalizing the index after quarantining failed documents."
                 )
@@ -1205,11 +1211,24 @@ def _run_document_index_job(
             completed_deletions = (
                 CORPUS_SCALE.mark_deletions_complete() if managed_queue else []
             )
+            queue = CORPUS_SCALE.snapshot() if managed_queue else {"counts": {}}
+            quarantined_deletions = [
+                str(item.get("source_id") or "")
+                for item in queue.get("items", [])
+                if item.get("status") == "quarantined"
+                and item.get("source_id")
+            ]
             if managed_queue:
-                DOCUMENT_REPOSITORY.clear_pending_sources((), tuple(completed_deletions))
+                DOCUMENT_REPOSITORY.clear_pending_sources(
+                    (),
+                    tuple(
+                        dict.fromkeys(
+                            [*completed_deletions, *quarantined_deletions]
+                        )
+                    ),
+                )
             if not managed_queue or not structured_events:
                 DOCUMENT_REPOSITORY.clear_pending()
-            queue = CORPUS_SCALE.snapshot() if managed_queue else {"counts": {}}
             quarantined = int(queue.get("counts", {}).get("quarantined", 0))
             _update_document_job(
                 state="complete_with_failures" if quarantined else "complete",
@@ -5251,6 +5270,8 @@ def create_web_app(demo: gr.Blocks | None = None) -> FastAPI:
     def list_managed_documents() -> dict[str, Any]:
         payload = DOCUMENT_REPOSITORY.summary()
         if CORPUS_SCALE.repository is DOCUMENT_REPOSITORY:
+            if CORPUS_SCALE.reconcile_completed_removals(payload):
+                payload = DOCUMENT_REPOSITORY.summary()
             CORPUS_SCALE.reconcile_indexed_documents(payload)
         payload["job"] = document_job_snapshot()
         payload["app_instance_id"] = _APP_INSTANCE_ID

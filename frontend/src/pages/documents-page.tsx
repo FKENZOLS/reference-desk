@@ -244,7 +244,8 @@ export function DocumentsPage() {
   const logLines = Array.isArray(state.job.log) ? state.job.log : []
   const queueItems = state.queue?.items || []
   const queueDone = queueItems.filter((item) => ["complete", "failed", "quarantined"].includes(item.status)).length
-  const queueProgress = queueItems.length ? Math.round((queueDone / queueItems.length) * 100) : (jobState === "complete" ? 100 : 0)
+  const queueFinalizing = Boolean(state.job.running && queueItems.length && !state.queue?.remaining)
+  const queueProgress = queueItems.length ? (queueFinalizing ? 96 : Math.round((queueDone / queueItems.length) * 100)) : (jobState === "complete" ? 100 : 0)
   const health = state.health
   const healthVariant = health?.status === "healthy" ? "default" : health?.status === "critical" ? "destructive" : "secondary"
 
@@ -285,9 +286,9 @@ export function DocumentsPage() {
         <Card className={`mb-5 ${jobState === "failed" ? "border-destructive/45" : "border-primary/30"}`}>
           <CardContent className="p-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div><p className="m-0 font-semibold">{jobState === "complete" ? "Index updated" : jobState === "complete_with_failures" ? "Index updated with quarantined files" : jobState === "failed" ? "Index update stopped" : jobState === "paused" ? "Ingestion paused" : "Ingestion queue"}</p>{queueItems.length > 0 && <p className="mb-0 mt-1 text-xs text-muted-foreground">{queueDone} of {queueItems.length} finished</p>}</div>
+              <div><p className="m-0 font-semibold">{jobState === "complete" ? "Index updated" : jobState === "complete_with_failures" ? "Index updated with quarantined files" : jobState === "failed" ? "Index update stopped" : jobState === "paused" ? "Ingestion paused" : queueFinalizing ? "Finalizing index" : "Ingestion queue"}</p>{queueItems.length > 0 && <p className="mb-0 mt-1 text-xs text-muted-foreground">{queueDone} of {queueItems.length} documents finished{queueFinalizing ? " · cleaning the index" : ""}</p>}</div>
               <div className="flex gap-2">
-                {state.job.running && <Button size="sm" variant="outline" onClick={pauseQueue} disabled={Boolean(state.job.pause_requested)}>{state.job.pause_requested ? <LoaderCircle className="animate-spin" /> : <Pause />} {state.job.pause_requested ? "Pausing" : "Pause"}</Button>}
+                {state.job.running && !queueFinalizing && <Button size="sm" variant="outline" onClick={pauseQueue} disabled={Boolean(state.job.pause_requested)}>{state.job.pause_requested ? <LoaderCircle className="animate-spin" /> : <Pause />} {state.job.pause_requested ? "Pausing" : "Pause"}</Button>}
                 {!state.job.running && state.queue?.remaining ? <Button size="sm" onClick={resumeQueue}><Play /> Resume</Button> : null}
                 <Badge variant="secondary">{jobState || "queued"}</Badge>
               </div>
@@ -313,7 +314,7 @@ export function DocumentsPage() {
                 {[['PDFs', health.storage.documents], ['Index', health.storage.index], ['Workspace', health.storage.workspace], ['Active total', health.storage.active]].map(([label, value]) => <div key={String(label)} className="rounded-lg border bg-background/45 p-3"><p className="m-0 text-xs text-muted-foreground">{label}</p><p className="mb-0 mt-1 font-semibold tabular-nums">{formatBytes(Number(value))}</p></div>)}
               </div>
               <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
-                {[['Quarantine', health.storage.quarantine], ['Revisions', health.storage.revisions], ['Backups', health.storage.backups], ['Total', health.storage.total]].map(([label, value]) => <div key={String(label)} className="flex items-center justify-between gap-2 rounded-lg bg-muted/20 px-3 py-2 text-xs"><span className="text-muted-foreground">{label}</span><span className="tabular-nums">{formatBytes(Number(value))}</span></div>)}
+                {[['Trash', health.storage.trash], ['Quarantine', health.storage.quarantine], ['Revisions', health.storage.revisions], ['Backups', health.storage.backups], ['Debug', health.storage.debug], ['Total stored', health.storage.total]].map(([label, value]) => <div key={String(label)} className="flex items-center justify-between gap-2 rounded-lg bg-muted/20 px-3 py-2 text-xs"><span className="text-muted-foreground">{label}</span><span className="tabular-nums">{formatBytes(Number(value))}</span></div>)}
               </div>
               {Boolean(health.storage.reclaimable) && <p className="mb-0 mt-3 text-xs text-muted-foreground">At least {formatBytes(Number(health.storage.reclaimable))} can be reclaimed. Rebuilding the vector index may recover additional reserved capacity.</p>}
               {!!health.issues.length && <div className="mt-4 space-y-2">{health.issues.map((issue) => <div key={issue.label} className="flex items-center justify-between gap-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-sm"><span>{issue.label}</span><Badge variant="secondary">{issue.count}</Badge></div>)}</div>}
