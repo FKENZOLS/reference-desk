@@ -43,6 +43,76 @@ def test_document_paths_are_relative_pdf_paths() -> None:
             DocumentRepository.normalize_source_id(unsafe)
 
 
+def test_state_repairs_a_uniquely_matched_windows_decoded_source_name(tmp_path) -> None:
+    repo = repository(tmp_path)
+    source_id = "Sönke — Anna’s Archive.pdf"
+    repo.commit_upload(temporary_pdf(tmp_path), source_id)
+    corrupted_id = "S�nke — Anna�s Archive.pdf"
+    state = json.loads(repo.state_path.read_text(encoding="utf-8"))
+    state["documents"][corrupted_id] = {
+        "status": "failed",
+        "error": "quarantine failed because the source was garbled",
+        "history": [],
+    }
+    repo.state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    summary = repo.summary()
+
+    assert [item["source_id"] for item in summary["documents"]] == [source_id]
+    repaired = json.loads(repo.state_path.read_text(encoding="utf-8"))
+    assert corrupted_id not in repaired["documents"]
+    assert repaired["documents"][source_id]["status"] == "pending"
+
+
+def test_failed_event_recovers_a_windows_decoded_source_before_quarantine(monkeypatch) -> None:
+    calls = []
+
+    class FakeRepository:
+        @staticmethod
+        def canonical_source_id(source_id):
+            assert source_id == "Anna�s.pdf"
+            return "Anna’s.pdf"
+
+        @staticmethod
+        def quarantine(source_id, error):
+            calls.append((source_id, error))
+
+    class FakeCorpus:
+        @staticmethod
+        def mark_event(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def invalidate_health():
+            return None
+
+    monkeypatch.setattr(search_app, "DOCUMENT_REPOSITORY", FakeRepository())
+    monkeypatch.setattr(search_app, "CORPUS_SCALE", FakeCorpus())
+
+    assert search_app._handle_corpus_event(
+        'CORPUS_EVENT {"event":"failed","source_id":"Anna\\ufffds.pdf",'
+        '"error_type":"RuntimeError","error":"missing page text"}'
+    )
+
+    assert calls[0][0] == "Anna’s.pdf"
+
+
+def test_state_recovers_a_uniquely_matched_unicode_source_name(tmp_path) -> None:
+    repo = repository(tmp_path)
+    source_id = "S" + chr(0x00F6) + "nke " + chr(0x2014) + " Anna" + chr(0x2019) + "s Archive.pdf"
+    corrupted_id = "S" + chr(0xFFFD) + "nke " + chr(0x2014) + " Anna" + chr(0xFFFD) + "s Archive.pdf"
+    repo.commit_upload(temporary_pdf(tmp_path), source_id)
+    state = json.loads(repo.state_path.read_text(encoding="utf-8"))
+    state["documents"][corrupted_id] = {"status": "failed", "history": []}
+    repo.state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    repo.summary()
+
+    repaired = json.loads(repo.state_path.read_text(encoding="utf-8"))
+    assert corrupted_id not in repaired["documents"]
+    assert repaired["documents"][source_id]["status"] == "pending"
+
+
 def test_upload_marks_document_pending_and_replace_is_explicit(tmp_path) -> None:
     repo = repository(tmp_path)
     stored = repo.commit_upload(

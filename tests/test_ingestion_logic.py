@@ -10,6 +10,7 @@ from ingest import (
     convert_page_range_resilient,
     docling_safe_pdf_path,
     embed_documents_in_batches,
+    emit_corpus_event,
     ids_fingerprint,
     infer_document_title,
     infer_retrieval_unit_type,
@@ -42,6 +43,17 @@ class FakeRuntime:
     @staticmethod
     def count_tokens(text: str) -> int:
         return len(text.split())
+
+
+def test_corpus_events_keep_unicode_source_names_safe_for_windows_stdout(capsys) -> None:
+    source_id = "Sönke — Anna’s Archive.pdf"
+
+    emit_corpus_event("failed", source_id=source_id)
+
+    encoded = capsys.readouterr().out.removeprefix("CORPUS_EVENT ")
+    assert "\\u00f6" in encoded
+    assert "\\u2019" in encoded
+    assert json.loads(encoded)["source_id"] == source_id
 
 
 def record(text: str, label: str, tokens: int) -> ChunkRecord:

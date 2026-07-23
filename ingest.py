@@ -2465,7 +2465,11 @@ def parse_args() -> argparse.Namespace:
 
 def emit_corpus_event(event: str, **values: Any) -> None:
     payload = {"event": event, **values}
-    print("CORPUS_EVENT " + json.dumps(payload, ensure_ascii=False), flush=True)
+    # Keep the stdout control protocol ASCII-only.  On Windows the child can
+    # otherwise encode a curly quote or accented letter in a console code page
+    # while the parent correctly reads UTF-8, turning a real source name into
+    # U+FFFD and preventing quarantine from locating the PDF.
+    print("CORPUS_EVENT " + json.dumps(payload, ensure_ascii=True), flush=True)
 
 
 def _commit_gate_is_open(path: Path, token: str) -> bool:

@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import shutil
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from secrets import token_hex
@@ -100,6 +101,49 @@ class DocumentRepository:
         if not resolved.is_relative_to(self.pdf_dir):
             raise DocumentPathError("The document path must stay inside the library.")
         return resolved
+
+    @staticmethod
+    def _source_identity(source_id: str) -> str:
+        """Return a conservative comparison key for recovering garbled names.
+
+        This is deliberately used only for source IDs that contain the Unicode
+        replacement character.  It is not a general filename matching rule.
+        """
+
+        decomposed = unicodedata.normalize("NFKD", str(source_id or "")).casefold()
+        return "".join(character for character in decomposed if character.isascii() and character.isalnum())
+
+    def _matching_library_source(self, source_id: str) -> str | None:
+        if "\ufffd" not in source_id or not self.pdf_dir.exists():
+            return None
+        # A replacement character means one (or occasionally more) bytes were
+        # lost during decoding. Treat only those positions as wildcards and
+        # require every other character to match. This is safer than fuzzy
+        # matching arbitrary filenames and still handles e.g. S�nke -> Sönke.
+        pattern = "^" + ".+?".join(
+            re.escape(unicodedata.normalize("NFKC", fragment).casefold())
+            for fragment in source_id.split("\ufffd")
+        ) + "$"
+        matcher = re.compile(pattern)
+        matches = [
+            path.resolve().relative_to(self.pdf_dir).as_posix()
+            for path in self.pdf_dir.rglob("*.pdf")
+            if path.is_file()
+            and matcher.fullmatch(
+                unicodedata.normalize(
+                    "NFKC", path.resolve().relative_to(self.pdf_dir).as_posix()
+                ).casefold()
+            )
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def canonical_source_id(self, source_id: str) -> str:
+        """Resolve a source ID, recovering a uniquely identifiable bad decode."""
+
+        normalized = self.normalize_source_id(source_id)
+        if self.resolve_source(normalized).is_file():
+            return normalized
+        return self._matching_library_source(normalized) or normalized
 
     @staticmethod
     def _read_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -202,8 +246,38 @@ class DocumentRepository:
                 for event in entry.get("history", [])
                 if isinstance(event, dict)
             ][-100:]
+        repaired = False
+        for source_id in list(state["documents"]):
+            canonical_source_id = self._matching_library_source(source_id)
+            if not canonical_source_id:
+                continue
+            corrupted = state["documents"].pop(source_id)
+            existing = state["documents"].get(canonical_source_id)
+            if existing is None:
+                corrupted["status"] = "pending"
+                corrupted["error"] = ""
+                corrupted.setdefault("history", []).append(
+                    {
+                        "from": str(corrupted.get("status") or "failed"),
+                        "to": "pending",
+                        "at": datetime.now(tz=UTC).isoformat(),
+                        "reason": "Recovered a Windows-decoded source name; retrying document",
+                    }
+                )
+                state["documents"][canonical_source_id] = corrupted
+            else:
+                existing.setdefault("history", []).append(
+                    {
+                        "from": str(existing.get("status") or "pending"),
+                        "to": str(existing.get("status") or "pending"),
+                        "at": datetime.now(tz=UTC).isoformat(),
+                        "reason": "Removed duplicate state entry with a corrupted Windows-decoded source name",
+                    }
+                )
+                existing["history"] = existing["history"][-100:]
+            repaired = True
         self._sync_legacy_views(state)
-        if migrated:
+        if migrated or repaired:
             backup = self.state_path.with_name(
                 f"{self.state_path.name}.pre-v2-migration.bak"
             )

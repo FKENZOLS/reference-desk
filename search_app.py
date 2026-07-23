@@ -807,6 +807,13 @@ def _handle_corpus_event(line: str) -> bool:
         return False
     kind = str(event.get("event") or "")
     source_id = str(event.get("source_id") or "")
+    if source_id and hasattr(DOCUMENT_REPOSITORY, "canonical_source_id"):
+        try:
+            source_id = DOCUMENT_REPOSITORY.canonical_source_id(source_id)
+        except (OSError, ValueError):
+            # The original ID remains useful for the queue error if recovery
+            # is unavailable or ambiguous.
+            pass
     if kind == "started" and source_id:
         CORPUS_SCALE.mark_event(source_id, "processing")
         if hasattr(DOCUMENT_REPOSITORY, "transition"):
@@ -1066,6 +1073,7 @@ def _run_document_index_job(
         environment = os.environ.copy()
         environment["RAG_OPEN_BROWSER"] = "0"
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
         if search_available:
             # Docling independently refuses to start if real free VRAM falls
             # below this combined reserve after the child process starts.
@@ -1161,6 +1169,7 @@ def _run_document_index_job(
             search_available = False
             environment = os.environ.copy()
             environment["RAG_OPEN_BROWSER"] = "0"
+            environment["PYTHONIOENCODING"] = "utf-8"
             environment["RAG_GPU_HEADROOM_WARNING_MB"] = str(
                 DOCLING_GPU_HEADROOM_MB
             )
